@@ -671,8 +671,46 @@ struct ResponsesRound {
 #[derive(Debug)]
 struct ToolExecution {
     output: String,
-    changed_path: Option<String>,
+    changed_file: Option<ChangedFile>,
     ok: bool,
+}
+
+#[derive(Debug)]
+struct ChangedFile {
+    path: String,
+    start_line: usize,
+    end_line: usize,
+}
+
+fn changed_line_range(before: &str, after: &str) -> (usize, usize) {
+    let before_lines = before.split('\n').collect::<Vec<_>>();
+    let after_lines = after.split('\n').collect::<Vec<_>>();
+    let mut prefix = 0;
+    while prefix < before_lines.len()
+        && prefix < after_lines.len()
+        && before_lines[prefix] == after_lines[prefix]
+    {
+        prefix += 1;
+    }
+
+    let mut suffix = 0;
+    while suffix < before_lines.len().saturating_sub(prefix)
+        && suffix < after_lines.len().saturating_sub(prefix)
+        && before_lines[before_lines.len() - 1 - suffix]
+            == after_lines[after_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let available_lines = after_lines.len().max(1);
+    let start_line = (prefix + 1).min(available_lines);
+    let changed_after = after_lines.len().saturating_sub(prefix + suffix);
+    let end_line = if changed_after == 0 {
+        start_line
+    } else {
+        (prefix + changed_after).min(available_lines)
+    };
+    (start_line, end_line.max(start_line))
 }
 
 #[derive(Clone, Debug)]
@@ -996,7 +1034,7 @@ async fn run_bounded_command(
             "stderrTruncated": stderr_truncated,
         })
         .to_string(),
-        changed_path: None,
+        changed_file: None,
         ok: status.success(),
     })
 }
@@ -1031,7 +1069,7 @@ async fn execute_tool(
             }
             Ok(ToolExecution {
                 output: value.to_string(),
-                changed_path: None,
+                changed_file: None,
                 ok: true,
             })
         }
@@ -1041,7 +1079,7 @@ async fn execute_tool(
             Ok(ToolExecution {
                 output: serde_json::to_string(&file)
                     .map_err(|error| format!("Workspace file could not be encoded: {error}"))?,
-                changed_path: None,
+                changed_file: None,
                 ok: true,
             })
         }
@@ -1078,11 +1116,17 @@ async fn execute_tool(
             } else {
                 current.content.replacen(old_text, new_text, 1)
             };
+            let (start_line, end_line) = changed_line_range(&current.content, &next);
             let saved = write_workspace_file_at(workspace, path.clone(), current.content, next)?;
+            let changed_file = ChangedFile {
+                path: saved.path.clone(),
+                start_line,
+                end_line,
+            };
             Ok(ToolExecution {
                 output: serde_json::to_string(&saved)
                     .map_err(|error| format!("Workspace file could not be encoded: {error}"))?,
-                changed_path: Some(path),
+                changed_file: Some(changed_file),
                 ok: true,
             })
         }
@@ -1094,11 +1138,17 @@ async fn execute_tool(
                 .writes
                 .lock()
                 .map_err(|_| "Workspace write state is unavailable".to_string())?;
+            let (start_line, end_line) = changed_line_range(&expected, &new_content);
             let saved = write_workspace_file_at(workspace, path.clone(), expected, new_content)?;
+            let changed_file = ChangedFile {
+                path: saved.path.clone(),
+                start_line,
+                end_line,
+            };
             Ok(ToolExecution {
                 output: serde_json::to_string(&saved)
                     .map_err(|error| format!("Workspace file could not be encoded: {error}"))?,
-                changed_path: Some(path),
+                changed_file: Some(changed_file),
                 ok: true,
             })
         }
@@ -1110,17 +1160,22 @@ async fn execute_tool(
                 .lock()
                 .map_err(|_| "Workspace write state is unavailable".to_string())?;
             let saved = create_workspace_file_at(workspace, path.clone(), content)?;
+            let changed_file = ChangedFile {
+                path: saved.path.clone(),
+                start_line: 1,
+                end_line: saved.content.split('\n').count().max(1),
+            };
             Ok(ToolExecution {
                 output: serde_json::to_string(&saved)
                     .map_err(|error| format!("Workspace file could not be encoded: {error}"))?,
-                changed_path: Some(path),
+                changed_file: Some(changed_file),
                 ok: true,
             })
         }
         "git_status" => Ok(ToolExecution {
             output: serde_json::to_string(&git_snapshot_at(workspace)?)
                 .map_err(|error| format!("Git status could not be encoded: {error}"))?,
-            changed_path: None,
+            changed_file: None,
             ok: true,
         }),
         "git_diff" => {
@@ -1134,7 +1189,7 @@ async fn execute_tool(
                 .ok_or_else(|| "Tool argument 'staged' must be a boolean".to_string())?;
             Ok(ToolExecution {
                 output: git_diff_at(workspace, staged, path)?,
-                changed_path: None,
+                changed_file: None,
                 ok: true,
             })
         }
@@ -1527,7 +1582,7 @@ async fn run_responses_agent(
                 match result {
                     Err(error) => ToolExecution {
                         output: json!({ "error": error }).to_string(),
-                        changed_path: None,
+                        changed_file: None,
                         ok: false,
                     },
                     Ok((name, role, task)) => {
@@ -1606,7 +1661,7 @@ async fn run_responses_agent(
                                         "result": outcome.text,
                                     })
                                     .to_string(),
-                                    changed_path: None,
+                                    changed_file: None,
                                     ok: true,
                                 }
                             }
@@ -1636,7 +1691,7 @@ async fn run_responses_agent(
                                         "error": error,
                                     })
                                     .to_string(),
-                                    changed_path: None,
+                                    changed_file: None,
                                     ok: false,
                                 }
                             }
@@ -1650,19 +1705,24 @@ async fn run_responses_agent(
                     Ok(execution) => execution,
                     Err(error) => ToolExecution {
                         output: json!({ "error": error }).to_string(),
-                        changed_path: None,
+                        changed_file: None,
                         ok: false,
                     },
                 }
             };
-            if let Some(path) = execution.changed_path.as_ref() {
+            if let Some(change) = execution.changed_file.as_ref() {
                 emit_agent(
                     on_event,
                     store,
                     request,
                     sequence,
                     "file.changed",
-                    json!({ "path": path, "tool": call.name }),
+                    json!({
+                        "path": change.path,
+                        "tool": call.name,
+                        "startLine": change.start_line,
+                        "endLine": change.end_line,
+                    }),
                     agent,
                 )?;
             }
@@ -2077,11 +2137,11 @@ pub fn runtime_cancel(run_id: String, control: State<'_, RuntimeControl>) -> Res
 mod tests {
     use super::{
         agent_instructions, anthropic_delta, anthropic_usage, api_url, await_cancellable_response,
-        merge_usage, parse_sse_data, provider_healthcheck_with_timeout, response_failure,
-        response_output_text, responses_input, run_responses_agent, send_anthropic_request,
-        send_responses_request, take_sse_block, terminate_child, tool_definitions, AgentBudget,
-        AgentContext, MemoryRecord, MessageRecord, ProviderConfig, RuntimeRequest,
-        ANTHROPIC_MAX_TOKENS, MAX_ERROR_BYTES, MAX_TOOL_ROUNDS,
+        changed_line_range, merge_usage, parse_sse_data, provider_healthcheck_with_timeout,
+        response_failure, response_output_text, responses_input, run_responses_agent,
+        send_anthropic_request, send_responses_request, take_sse_block, terminate_child,
+        tool_definitions, AgentBudget, AgentContext, MemoryRecord, MessageRecord, ProviderConfig,
+        RuntimeRequest, ANTHROPIC_MAX_TOKENS, MAX_ERROR_BYTES, MAX_TOOL_ROUNDS,
     };
     use crate::{store::AppStore, WorkspaceAccess};
     use serde_json::json;
@@ -2102,6 +2162,18 @@ mod tests {
             adapter: "openai-chat".into(),
             api_key: "test-secret".into(),
         }
+    }
+
+    #[test]
+    fn changed_line_range_tracks_replacements_insertions_and_deletions() {
+        assert_eq!(
+            changed_line_range("one\ntwo\nthree", "one\nchanged\nthree"),
+            (2, 2)
+        );
+        assert_eq!(changed_line_range("one\nthree", "one\ntwo\nthree"), (2, 2));
+        assert_eq!(changed_line_range("one\ntwo\nthree", "one\nthree"), (2, 2));
+        assert_eq!(changed_line_range("one\ntwo", "one"), (1, 1));
+        assert_eq!(changed_line_range("", "first\nsecond"), (1, 2));
     }
 
     fn serve_once(status: u16, body: Vec<u8>, body_delay: Duration) -> String {

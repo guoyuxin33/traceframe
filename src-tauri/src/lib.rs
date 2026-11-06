@@ -184,19 +184,24 @@ impl WorkspaceAccess {
 
 fn safe_relative_path(path: &str) -> Result<PathBuf, String> {
     let relative = Path::new(path);
-    if path.is_empty()
-        || relative.is_absolute()
-        || relative.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
+    if path.is_empty() || relative.is_absolute() {
         return Err("Workspace file path is invalid".into());
     }
 
-    Ok(relative.to_path_buf())
+    let mut normalized = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(segment) => normalized.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err("Workspace file path is invalid".into())
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err("Workspace file path is invalid".into());
+    }
+    Ok(normalized)
 }
 
 fn display_relative(path: &Path) -> String {
@@ -1052,9 +1057,14 @@ mod tests {
     #[test]
     fn rejects_paths_outside_workspace() {
         assert!(safe_relative_path("src/main.rs").is_ok());
+        assert_eq!(
+            safe_relative_path("./src//main.rs").unwrap(),
+            Path::new("src/main.rs")
+        );
         assert!(safe_relative_path("../secrets.txt").is_err());
         assert!(safe_relative_path("/tmp/secrets.txt").is_err());
         assert!(safe_relative_path("").is_err());
+        assert!(safe_relative_path("./").is_err());
     }
 
     #[test]

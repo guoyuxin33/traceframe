@@ -16,6 +16,8 @@ This project has no tagged public release yet. The current package version is `0
 - Direct OpenAI Responses and local CC Switch Responses adapters with model discovery.
 - Anthropic and OpenAI-compatible streamed conversation adapters.
 - Official current OpenAI text/code model catalog reference in settings.
+- Line-aware agent edit following that activates Code, opens the changed file, centers and marks the affected range, and can be paused for manual navigation.
+- Per-session follow-up prompt queues with Enter-to-send, Shift+Enter multiline input, visible ordering, removal, and automatic serial execution.
 
 ### Changed
 
@@ -25,11 +27,14 @@ This project has no tagged public release yet. The current package version is `0
 - Compacted messages are excluded from later runtime input while their durable summary remains available.
 - Non-Responses provider requests can be cancelled while waiting for response headers and record terminal failures consistently.
 - Responses runs use a tools-disabled synthesis request after exhausting their tool-round budget instead of failing immediately after the last successful tool call.
+- File paths emitted by mutating runtime tools are normalized before renderer navigation.
 
 ### Fixed
 
 - Opening the native workspace picker no longer blocks the Tauri event loop; the dialog is asynchronous, parented to the application window, visibly pending, and guarded against duplicate opens.
 - Cancelling the picker or selecting a non-Git directory preserves the last successfully loaded workspace, and invalid directories are not saved as recent workspaces.
+- Manual file navigation and unsaved editor drafts no longer lose races with pending agent-follow refreshes.
+- Agent edit navigation runs once per event and no longer resets the caret while the user continues editing.
 
 ### Security
 

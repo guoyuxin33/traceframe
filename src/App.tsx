@@ -12,6 +12,7 @@ import {
   ChevronRight,
   CircleDot,
   Cpu,
+  Crosshair,
   Database,
   File,
   FileCode2,
@@ -88,6 +89,31 @@ function errorMessage(error: unknown) {
 
 type SettingsSection = 'models' | 'appearance'
 type EditorMode = 'view' | 'edit'
+
+export interface AgentEditTarget {
+  path: string
+  startLine: number
+  endLine: number
+  eventId: string
+}
+
+export interface QueuedPrompt {
+  id: string
+  sessionId: string
+  text: string
+}
+
+export function agentEditTarget(event: RuntimeEventRecord): AgentEditTarget | null {
+  if (event.type !== 'file.changed') return null
+  const path = typeof event.payload.path === 'string' ? event.payload.path : ''
+  const segments = path.split('/')
+  if (!path.trim() || path.startsWith('/') || path.includes('\\') || segments.some((segment) => !segment || segment === '.' || segment === '..')) return null
+  const rawStart = typeof event.payload.startLine === 'number' ? event.payload.startLine : 1
+  const rawEnd = typeof event.payload.endLine === 'number' ? event.payload.endLine : rawStart
+  const startLine = Number.isSafeInteger(rawStart) && rawStart > 0 ? rawStart : 1
+  const endLine = Number.isSafeInteger(rawEnd) && rawEnd >= startLine ? rawEnd : startLine
+  return { path, startLine, endLine, eventId: event.id }
+}
 
 interface UiPreferences {
   theme: 'graphite' | 'light' | 'terminal'
@@ -556,16 +582,23 @@ export function ConversationPanel({
   liveMessage,
   agents,
   disabled,
+  runActive = false,
+  queuedPrompts = [],
   onSend,
+  onRemoveQueued = () => undefined,
 }: {
   session: Session
   messages: Message[]
   liveMessage?: Message
   agents: Agent[]
   disabled: boolean
+  runActive?: boolean
+  queuedPrompts?: QueuedPrompt[]
   onSend: (text: string) => Promise<boolean>
+  onRemoveQueued?: (id: string) => void
 }) {
   const [drafts, setDrafts] = useState<Record<string, string>>({})
+  const [submitting, setSubmitting] = useState(false)
   const streamEnd = useRef<HTMLDivElement>(null)
   const draft = drafts[session.id] ?? ''
   const workingAgents = agents.filter((agent) => agent.state === 'working')
@@ -577,9 +610,15 @@ export function ConversationPanel({
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
-    if (disabled || !draft.trim()) return
-    if (await onSend(draft.trim())) {
-      setDrafts((current) => ({ ...current, [session.id]: '' }))
+    if (disabled || submitting || !draft.trim()) return
+    const submittedDraft = draft
+    setSubmitting(true)
+    try {
+      if (await onSend(submittedDraft.trim())) {
+        setDrafts((current) => current[session.id] === submittedDraft ? { ...current, [session.id]: '' } : current)
+      }
+    } finally {
+      setSubmitting(false)
     }
   }
 
@@ -609,20 +648,38 @@ export function ConversationPanel({
         <div ref={streamEnd} />
       </div>
 
+      {queuedPrompts.length ? (
+        <div className="prompt-queue" aria-label="待执行消息队列">
+          {queuedPrompts.map((prompt, index) => (
+            <div className="prompt-queue-row" key={prompt.id}>
+              <span>{index + 1}</span>
+              <p>{prompt.text}</p>
+              <button type="button" onClick={() => onRemoveQueued(prompt.id)} aria-label={`移除排队消息 ${index + 1}`} title="Remove queued message"><X size={13} /></button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
       <form className="composer" onSubmit={submit}>
         <textarea
           value={draft}
           onChange={(event) => setDrafts((current) => ({ ...current, [session.id]: event.target.value }))}
+          onKeyDown={(event) => {
+            if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return
+            event.preventDefault()
+            event.currentTarget.form?.requestSubmit()
+          }}
           disabled={disabled}
           rows={3}
-          placeholder={session.archived ? 'Restore this session to continue' : disabled ? 'Run in progress' : 'Message orchestrator…'}
+          placeholder={session.archived ? 'Restore this session to continue' : runActive ? 'Add the next turn to the queue…' : 'Message orchestrator…'}
           aria-label="发送给主智能体"
         />
         <div className="composer-footer">
           <div className="composer-tools">
             <span className="scope-label">scope: {session.branch}</span>
+            {runActive || queuedPrompts.length ? <span className="composer-queue-state">{queuedPrompts.length} queued</span> : null}
           </div>
-          <button className="send-button" type="submit" aria-label="发送消息" disabled={disabled || !draft.trim()}><Send size={16} /></button>
+          <button className="send-button" type="submit" aria-label={runActive ? '排队消息' : '发送消息'} disabled={disabled || submitting || !draft.trim()}><Send size={16} /></button>
         </div>
       </form>
     </section>
@@ -641,6 +698,7 @@ export function FileTree({
   selected,
   loading,
   disabled = false,
+  controlsDisabled = false,
   onSelect,
   onRefresh,
   onOpen,
@@ -649,6 +707,7 @@ export function FileTree({
   selected: string
   loading: boolean
   disabled?: boolean
+  controlsDisabled?: boolean
   onSelect: (name: string) => void
   onRefresh: () => void
   onOpen: () => void
@@ -687,7 +746,7 @@ export function FileTree({
       <div className="file-tree-head">
         <span>Explorer</span>
         {workspace ? (
-          <button type="button" className={`tree-refresh${loading ? ' is-loading' : ''}`} onClick={onRefresh} disabled={loading || disabled} aria-busy={loading} aria-label="刷新工作区" title="刷新工作区">
+          <button type="button" className={`tree-refresh${loading ? ' is-loading' : ''}`} onClick={onRefresh} disabled={loading || disabled || controlsDisabled} aria-busy={loading} aria-label="刷新工作区" title="刷新工作区">
             <RefreshCw size={13} className={loading ? 'is-spinning' : ''} />
           </button>
         ) : null}
@@ -700,7 +759,7 @@ export function FileTree({
         {!workspace ? (
           <div className="tree-empty">
             <p>Select a local Git repository to inspect its files and changes.</p>
-            <button type="button" disabled={loading || disabled} onClick={onOpen}><FolderOpen size={14} />Open folder</button>
+            <button type="button" disabled={loading || disabled || controlsDisabled} onClick={onOpen}><FolderOpen size={14} />Open folder</button>
           </div>
         ) : null}
         {workspace?.treeTruncated ? <div className="tree-limit">Explorer limited to 800 entries. Changed files are listed first.</div> : null}
@@ -758,10 +817,14 @@ export function CodeView({
   saving,
   saveError,
   canEdit,
+  agentEdit = null,
+  followAgent = true,
+  followBlocked = false,
   onMode,
   onDraft,
   onSave,
   onRevert,
+  onFollowAgent = () => undefined,
 }: {
   file: WorkspaceFile | null
   loading: boolean
@@ -773,20 +836,50 @@ export function CodeView({
   saving: boolean
   saveError: string | null
   canEdit: boolean
+  agentEdit?: AgentEditTarget | null
+  followAgent?: boolean
+  followBlocked?: boolean
   onMode: (mode: EditorMode) => void
   onDraft: (content: string) => void
   onSave: () => void
   onRevert: () => void
+  onFollowAgent?: (enabled: boolean) => void
 }) {
   const gutterRef = useRef<HTMLPreElement>(null)
   const editorRef = useRef<HTMLTextAreaElement>(null)
+  const viewerRef = useRef<HTMLDivElement>(null)
   const [tabMovesFocus, setTabMovesFocus] = useState(false)
+  const content = file ? draftPath === file.path ? draft : file.content : ''
+  const contentRef = useRef(content)
+  contentRef.current = content
+  const lines = content.split('\n')
+  const activeEdit = file && agentEdit?.path === file.path ? agentEdit : null
+
+  useEffect(() => {
+    if (!activeEdit || !file) return
+    const currentLines = contentRef.current.split('\n')
+    const startLine = Math.min(activeEdit.startLine, currentLines.length)
+    const endLine = Math.min(Math.max(activeEdit.endLine, startLine), currentLines.length)
+    const frame = requestAnimationFrame(() => {
+      if (mode === 'edit' && canEdit && editorRef.current) {
+        const beforeStart = currentLines.slice(0, startLine - 1).join('\n')
+        const throughEnd = currentLines.slice(0, endLine).join('\n')
+        const startOffset = beforeStart.length + (startLine > 1 ? 1 : 0)
+        editorRef.current.setSelectionRange(startOffset, Math.max(startOffset, throughEnd.length))
+        editorRef.current.scrollTop = Math.max(0, (startLine - 1) * 20 - editorRef.current.clientHeight * 0.35)
+        if (gutterRef.current) gutterRef.current.scrollTop = editorRef.current.scrollTop
+        return
+      }
+      const line = viewerRef.current?.querySelector<HTMLElement>(`[data-line="${startLine}"]`)
+      if (line && typeof line.scrollIntoView === 'function') line.scrollIntoView({ block: 'center' })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [activeEdit?.eventId, canEdit, file?.path, mode])
+
   if (loading) return <div className="workspace-empty"><RefreshCw className="is-spinning" size={18} /><strong>Reading file</strong></div>
   if (error && !file) return <div className="workspace-empty is-error"><File size={18} /><strong>Preview unavailable</strong><p>{error}</p></div>
   if (!file) return <div className="workspace-empty"><FileCode2 size={18} /><strong>Select a file</strong><p>Code and diffs stay tied to the selected workspace.</p></div>
 
-  const content = draftPath === file.path ? draft : file.content
-  const lines = content.split('\n')
   return (
     <div className={`code-editor mode-${mode}`} role="region" aria-label="代码编辑器">
       <div className="code-editor-toolbar">
@@ -794,8 +887,12 @@ export function CodeView({
           <button type="button" className={mode === 'view' ? 'is-active' : ''} aria-pressed={mode === 'view'} onClick={() => onMode('view')} disabled={saving}>View</button>
           <button type="button" className={mode === 'edit' ? 'is-active' : ''} aria-pressed={mode === 'edit'} onClick={() => onMode('edit')} disabled={!canEdit || saving}>Edit</button>
         </div>
-        <span className={`editor-file-state${dirty ? ' is-dirty' : ''}`}>{dirty ? 'Unsaved changes' : file.truncated ? 'Read only' : 'Saved'}</span>
+        <span className={`editor-file-state${dirty ? ' is-dirty' : ''}`}>{dirty ? 'Unsaved changes' : activeEdit ? `Agent edit · L${activeEdit.startLine}${activeEdit.endLine > activeEdit.startLine ? `–${activeEdit.endLine}` : ''}` : file.truncated ? 'Read only' : 'Saved'}</span>
         <div className="editor-actions">
+          <button className={`editor-follow${followAgent ? ' is-active' : ''}${followBlocked ? ' is-blocked' : ''}`} type="button" aria-pressed={followAgent} onClick={() => onFollowAgent(!followAgent)} title={followBlocked ? 'Save or revert local changes before following the agent' : followAgent ? 'Pause automatic agent navigation' : 'Follow the latest agent edit'}>
+            <Crosshair size={14} />
+            {followBlocked ? 'Blocked' : followAgent ? 'Following' : 'Follow'}
+          </button>
           <button type="button" onClick={onRevert} disabled={!dirty || saving} title="Revert unsaved changes"><RotateCcw size={14} />Revert</button>
           <button className="editor-save" type="button" onClick={onSave} disabled={!dirty || saving || !canEdit} title="Save file">
             {saving ? <RefreshCw className="is-spinning" size={14} /> : <Save size={14} />}
@@ -838,9 +935,9 @@ export function CodeView({
           <span className="sr-only" id="editor-tab-help">Press Escape then Tab to move focus out of the editor</span>
         </div>
       ) : (
-        <div className="code-view">
+        <div className="code-view" ref={viewerRef} data-agent-edit={activeEdit?.eventId}>
           {lines.map((line, index) => (
-            <div className="code-line" key={`${index}-${line.slice(0, 16)}`}>
+            <div className={`code-line${activeEdit && index + 1 >= activeEdit.startLine && index + 1 <= activeEdit.endLine ? ' is-agent-edit' : ''}`} data-line={index + 1} key={`${activeEdit?.eventId ?? 'line'}-${index}-${line.slice(0, 16)}`}>
               <span className="line-number">{index + 1}</span>
               <code>{line || ' '}</code>
             </div>
@@ -1068,9 +1165,13 @@ interface RepositoryDockProps {
   error: string | null
   fileError: string | null
   diffError: string | null
+  agentEdit?: AgentEditTarget | null
+  followAgent?: boolean
+  followBlocked?: boolean
   onSelectFile: (path: string) => void
   onRefresh: () => void
   onOpenWorkspace: () => void
+  onFollowAgent?: (enabled: boolean) => void
   editor: {
     mode: EditorMode
     draft: string
@@ -1099,9 +1200,13 @@ export function RepositoryDock({
   error,
   fileError,
   diffError,
+  agentEdit = null,
+  followAgent = true,
+  followBlocked = false,
   onSelectFile,
   onRefresh,
   onOpenWorkspace,
+  onFollowAgent = () => undefined,
   editor,
 }: RepositoryDockProps) {
   const breadcrumbs = selectedFile.split('/').filter(Boolean)
@@ -1114,7 +1219,8 @@ export function RepositoryDock({
           workspace={workspace}
           selected={selectedFile}
           loading={loading}
-          disabled={branchBusy || interactionBusy || editor.saving}
+          disabled={branchBusy || editor.saving}
+          controlsDisabled={interactionBusy}
           onSelect={onSelectFile}
           onRefresh={onRefresh}
           onOpen={onOpenWorkspace}
@@ -1141,10 +1247,14 @@ export function RepositoryDock({
                 saving={editor.saving}
                 saveError={editor.error}
                 canEdit={editor.canEdit}
+                agentEdit={agentEdit}
+                followAgent={followAgent}
+                followBlocked={followBlocked}
                 onMode={editor.onMode}
                 onDraft={editor.onDraft}
                 onSave={editor.onSave}
                 onRevert={editor.onRevert}
+                onFollowAgent={onFollowAgent}
               />
               : <DiffView diff={diff} path={selectedFile} loading={fileLoading} error={diffError} />}
           </div>
@@ -1663,6 +1773,8 @@ export default function App() {
   const [sessionAgents, setSessionAgents] = useState<Record<string, Agent[]>>(() => desktop ? {} : loadStored('traceframe.session-agents', initialSessionAgents))
   const [memories, setMemories] = useState<MemoryRecord[]>(() => desktop ? [] : loadStored('traceframe.memories', initialMemories))
   const [runtimeEvents, setRuntimeEvents] = useState<RuntimeEventRecord[]>([])
+  const [queuedPrompts, setQueuedPrompts] = useState<QueuedPrompt[]>([])
+  const queuedPromptsRef = useRef<QueuedPrompt[]>([])
   const [branch, setBranch] = useState('main')
   const [model, setModel] = useState(() => loadStored('traceframe.model', 'cc-switch'))
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -1688,6 +1800,10 @@ export default function App() {
   const [editorDraft, setEditorDraft] = useState('')
   const [editorSaving, setEditorSaving] = useState(false)
   const [editorError, setEditorError] = useState<string | null>(null)
+  const [followAgentEdits, setFollowAgentEdits] = useState(true)
+  const followAgentEditsRef = useRef(true)
+  const [latestAgentEdit, setLatestAgentEdit] = useState<AgentEditTarget | null>(null)
+  const latestAgentEditRef = useRef<AgentEditTarget | null>(null)
   const [branchBusy, setBranchBusy] = useState(false)
   const [activeRunId, setActiveRunId] = useState<string | null>(null)
   const activeRunRef = useRef<string | null>(null)
@@ -1695,12 +1811,35 @@ export default function App() {
   const workspaceRequest = useRef(0)
   const fileRequest = useRef(0)
   const selectedFileRef = useRef('')
-  const runtimeRefreshTimer = useRef<number | null>(null)
+  const handledFileEventIdsRef = useRef(new Set<string>())
+  const lastLoadedAgentEditIdRef = useRef('')
+  const agentNavigationTokenRef = useRef(0)
+  const agentNavigationPendingRef = useRef(false)
+  const agentNavigationOriginRef = useRef('')
   const editorDirty = Boolean(editorPath && editorPath === selectedFile && editorDraft !== editorBaseline)
   const editorDirtyRef = useRef(false)
   editorDirtyRef.current = editorDirty
   const [preferences, setPreferences] = useState<UiPreferences>(() => ({ ...defaultUiPreferences, ...loadStored('traceframe.appearance', defaultUiPreferences) }))
   const [dockModel, setDockModel] = useState(() => storedDockModel(preferences.layout))
+
+  const showDock = useCallback((component: DockComponent) => {
+    if (dockModel.getNodeById(component)) dockModel.doAction(Actions.selectTab(component))
+  }, [dockModel])
+
+  const setFollowAgent = useCallback((enabled: boolean) => {
+    followAgentEditsRef.current = enabled
+    setFollowAgentEdits(enabled)
+  }, [])
+
+  const updateQueuedPrompts = useCallback((update: (current: QueuedPrompt[]) => QueuedPrompt[]) => {
+    const next = update(queuedPromptsRef.current)
+    queuedPromptsRef.current = next
+    setQueuedPrompts(next)
+  }, [])
+
+  const removeQueuedPrompt = useCallback((id: string) => {
+    updateQueuedPrompts((current) => current.filter((prompt) => prompt.id !== id))
+  }, [updateQueuedPrompts])
 
   const applySnapshot = useCallback((snapshot: Awaited<ReturnType<typeof getAppSnapshot>>) => {
     const grouped = snapshot.messages.reduce<Record<string, Message[]>>((result, message) => {
@@ -1803,6 +1942,35 @@ export default function App() {
     }
   }, [loadWorkspaceFile])
 
+  const navigateToAgentEdit = useCallback((target: AgentEditTarget, workspacePath: string) => {
+    const token = ++agentNavigationTokenRef.current
+    agentNavigationPendingRef.current = true
+    agentNavigationOriginRef.current = selectedFileRef.current
+    showDock('code')
+    void loadWorkspace(workspacePath, target.path)
+      .then((loaded) => {
+        if (loaded && agentNavigationTokenRef.current === token) lastLoadedAgentEditIdRef.current = target.eventId
+      })
+      .finally(() => {
+        if (agentNavigationTokenRef.current === token) agentNavigationPendingRef.current = false
+      })
+  }, [loadWorkspace, showDock])
+
+  const cancelAgentNavigation = useCallback((restoreOrigin: boolean) => {
+    if (!agentNavigationPendingRef.current) return
+    const origin = agentNavigationOriginRef.current
+    agentNavigationTokenRef.current += 1
+    agentNavigationPendingRef.current = false
+    workspaceRequest.current += 1
+    fileRequest.current += 1
+    setWorkspaceLoading(false)
+    setFileLoading(false)
+    const currentWorkspace = workspaceRef.current
+    if (restoreOrigin && origin && currentWorkspace && origin !== selectedFileRef.current) {
+      void loadWorkspaceFile(currentWorkspace.path, origin)
+    }
+  }, [loadWorkspaceFile])
+
   useEffect(() => {
     document.documentElement.classList.toggle('tauri-desktop', isDesktopRuntime())
     if (!isDesktopRuntime()) return
@@ -1892,10 +2060,6 @@ export default function App() {
       window.removeEventListener('beforeunload', beforeUnload)
     }
   }, [desktop])
-
-  useEffect(() => () => {
-    if (runtimeRefreshTimer.current !== null) window.clearTimeout(runtimeRefreshTimer.current)
-  }, [])
 
   useEffect(() => {
     if (!desktop) localStorage.setItem('traceframe.sessions', JSON.stringify(sessions))
@@ -2050,9 +2214,11 @@ export default function App() {
   }
 
   const selectWorkspaceFile = (path: string) => {
-    if (activeRunRef.current || runCancelPending || editorSaving) return
+    if (runCancelPending || editorSaving) return
     if (path === selectedFile) return
     if (!confirmDiscardEditorChanges('opening another file')) return
+    cancelAgentNavigation(false)
+    if (latestAgentEditRef.current) setFollowAgent(false)
     if (workspace) void loadWorkspaceFile(workspace.path, path)
   }
 
@@ -2060,6 +2226,13 @@ export default function App() {
     setEditorDraft(editorBaseline)
     setEditorError(null)
   }
+
+  useEffect(() => {
+    const target = latestAgentEditRef.current
+    const currentWorkspace = workspaceRef.current
+    if (editorDirty || !followAgentEdits || !target || !currentWorkspace || agentNavigationPendingRef.current || lastLoadedAgentEditIdRef.current === target.eventId) return
+    navigateToAgentEdit(target, currentWorkspace.path)
+  }, [editorDirty, followAgentEdits, navigateToAgentEdit, selectedFile])
 
   const selectSession = async (session: Session) => {
     if (activeRunRef.current || branchBusy || workspaceLoading || editorSaving) return
@@ -2123,10 +2296,13 @@ export default function App() {
   const sendMessage = async (text: string): Promise<boolean> => {
     const sessionId = activeSession.id
     if (desktop) {
-      if (activeRunRef.current) return false
       if (activeSession.archived) {
         setAppError('Restore this archived session before starting another run.')
         return false
+      }
+      if (activeRunRef.current) {
+        updateQueuedPrompts((current) => [...current, { id: crypto.randomUUID(), sessionId, text }])
+        return true
       }
       if (!workspace) {
         setAppError('Open a local workspace before starting a coding run.')
@@ -2152,7 +2328,12 @@ export default function App() {
       }
       setAppError(null)
       const runId = crypto.randomUUID()
-      if (runtimeRefreshTimer.current !== null) window.clearTimeout(runtimeRefreshTimer.current)
+      cancelAgentNavigation(false)
+      setFollowAgent(true)
+      handledFileEventIdsRef.current.clear()
+      lastLoadedAgentEditIdRef.current = ''
+      latestAgentEditRef.current = null
+      setLatestAgentEdit(null)
       activeRunRef.current = runId
       setRunCancelPending(false)
       setRunState('running')
@@ -2180,11 +2361,16 @@ export default function App() {
           await startNativeRun({ runId, sessionId, workspacePath: workspace.path, branch, prompt: text, provider }, (event) => {
             setRuntimeEvents((current) => [event, ...current.filter((item) => item.id !== event.id)].slice(0, 500))
             if (event.type === 'file.changed') {
-              if (runtimeRefreshTimer.current !== null) window.clearTimeout(runtimeRefreshTimer.current)
-              runtimeRefreshTimer.current = window.setTimeout(() => {
-                runtimeRefreshTimer.current = null
-                void loadWorkspace(workspace.path, selectedFileRef.current)
-              }, 200)
+              const target = agentEditTarget(event)
+              if (!target) return
+              if (handledFileEventIdsRef.current.has(target.eventId)) return
+              handledFileEventIdsRef.current.add(target.eventId)
+              latestAgentEditRef.current = target
+              setLatestAgentEdit(target)
+              if (!followAgentEditsRef.current) return
+              showDock('code')
+              if (editorDirtyRef.current) return
+              navigateToAgentEdit(target, workspace.path)
             }
           })
         } catch (error) {
@@ -2196,18 +2382,29 @@ export default function App() {
           }
           setAppError(detail)
         } finally {
-        if (runtimeRefreshTimer.current !== null) {
-          window.clearTimeout(runtimeRefreshTimer.current)
-          runtimeRefreshTimer.current = null
-        }
-        if (activeRunRef.current === runId) {
-          activeRunRef.current = null
-          setRunState('idle')
-          setActiveRunId(null)
-        }
-        setRunCancelPending(false)
-        await reloadNativeState().catch((error) => setAppError(errorMessage(error)))
-        await loadWorkspace(workspace.path, selectedFile).catch(() => undefined)
+          await reloadNativeState().catch((error) => setAppError(errorMessage(error)))
+          const latestTarget = latestAgentEditRef.current
+          const finalFile = followAgentEditsRef.current && !editorDirtyRef.current && latestTarget ? latestTarget.path : selectedFileRef.current
+          await loadWorkspace(workspace.path, finalFile).catch(() => undefined)
+          if (activeRunRef.current === runId) {
+            const nextPrompt = queuedPromptsRef.current.find((prompt) => prompt.sessionId === sessionId)
+            activeRunRef.current = null
+            setActiveRunId(null)
+            setRunCancelPending(false)
+            if (nextPrompt) {
+              updateQueuedPrompts((current) => current.filter((prompt) => prompt.id !== nextPrompt.id))
+              void sendMessage(nextPrompt.text).then((accepted) => {
+                if (!accepted) {
+                  updateQueuedPrompts((current) => [nextPrompt, ...current])
+                  setRunState('idle')
+                }
+              })
+            } else {
+              setRunState('idle')
+            }
+          } else {
+            setRunCancelPending(false)
+          }
         }
       })()
       return true
@@ -2321,6 +2518,7 @@ export default function App() {
     const runId = activeRunRef.current ?? activeRunId
     if (runId) {
       if (runCancelPending) return
+      updateQueuedPrompts((current) => current.filter((prompt) => prompt.sessionId !== activeSession.id))
       setRunCancelPending(true)
       setAppError(null)
       const outcome = await requestRunCancellation(runId)
@@ -2356,6 +2554,18 @@ export default function App() {
 
   const closeSettings = useCallback(() => setSettingsOpen(false), [])
 
+  const changeFollowAgent = useCallback((enabled: boolean) => {
+    setFollowAgent(enabled)
+    if (!enabled) {
+      cancelAgentNavigation(true)
+      return
+    }
+    const target = latestAgentEditRef.current
+    const currentWorkspace = workspaceRef.current
+    if (!target || !currentWorkspace || editorDirtyRef.current) return
+    navigateToAgentEdit(target, currentWorkspace.path)
+  }, [cancelAgentNavigation, navigateToAgentEdit, setFollowAgent])
+
   const dockFactory = (node: TabNode) => {
     const component = node.getComponent() as DockComponent
     if (component === 'sessions') {
@@ -2373,7 +2583,17 @@ export default function App() {
       />
     }
     if (component === 'conversation') {
-      return <ConversationPanel session={activeSession} messages={messages} liveMessage={liveMessage} agents={agents} disabled={runState === 'running' || Boolean(activeSession.archived)} onSend={sendMessage} />
+      return <ConversationPanel
+        session={activeSession}
+        messages={messages}
+        liveMessage={liveMessage}
+        agents={agents}
+        disabled={Boolean(activeSession.archived)}
+        runActive={runState === 'running'}
+        queuedPrompts={queuedPrompts.filter((prompt) => prompt.sessionId === activeSession.id)}
+        onSend={sendMessage}
+        onRemoveQueued={removeQueuedPrompt}
+      />
     }
     if (component === 'code' || component === 'diff') {
       const interactionBusy = runState === 'running' || runCancelPending || workspacePickerPending
@@ -2390,9 +2610,13 @@ export default function App() {
         error={workspaceError}
         fileError={fileError}
         diffError={diffError}
+        agentEdit={latestAgentEdit}
+        followAgent={followAgentEdits}
+        followBlocked={followAgentEdits && editorDirty}
         onSelectFile={selectWorkspaceFile}
         onRefresh={refreshWorkspace}
         onOpenWorkspace={() => void openWorkspace()}
+        onFollowAgent={changeFollowAgent}
         editor={{
           mode: editorMode,
           draft: editorDraft,
@@ -2425,10 +2649,6 @@ export default function App() {
     }
     return null
   }
-
-  const showDock = useCallback((component: DockComponent) => {
-    if (dockModel.getNodeById(component)) dockModel.doAction(Actions.selectTab(component))
-  }, [dockModel])
 
   const focusDockControl = useCallback((component: DockComponent, selector: string) => {
     showDock(component)

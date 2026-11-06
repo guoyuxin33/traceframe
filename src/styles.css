@@ -926,6 +926,41 @@ code,
 kbd,
 .tabular { font-family: 'IBM Plex Mono', monospace; }
 
+.prompt-queue {
+  max-height: 112px;
+  margin: 8px 12px 0;
+  overflow-y: auto;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.prompt-queue-row {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) 28px;
+  min-height: 36px;
+  align-items: center;
+  color: var(--text-secondary);
+  gap: 4px;
+}
+
+.prompt-queue-row + .prompt-queue-row { border-top: 1px solid var(--line); }
+.prompt-queue-row > span { color: var(--accent); font-family: 'IBM Plex Mono', monospace; font-size: 9px; text-align: center; }
+.prompt-queue-row p { overflow: hidden; margin: 0; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+
+.prompt-queue-row button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.prompt-queue-row button:hover { background: var(--surface-raised); color: var(--text); }
+
 .composer {
   margin: 8px 12px 12px;
   border: 1px solid var(--line-strong);
@@ -980,6 +1015,12 @@ kbd,
 
 .scope-label {
   color: var(--text-muted);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 9px;
+}
+
+.composer-queue-state {
+  color: var(--accent);
   font-family: 'IBM Plex Mono', monospace;
   font-size: 9px;
 }
@@ -1337,6 +1378,8 @@ kbd,
 .editor-actions button:disabled { color: var(--text-muted); cursor: not-allowed; opacity: 0.56; }
 .editor-actions button:disabled:hover { background: transparent; border-color: var(--line); }
 .editor-actions .editor-save:not(:disabled) { border-color: transparent; background: var(--text); color: var(--surface-deep); }
+.editor-actions .editor-follow.is-active { border-color: rgba(103, 184, 145, 0.28); background: rgba(103, 184, 145, 0.08); color: var(--positive); }
+.editor-actions .editor-follow.is-blocked { border-color: rgba(211, 173, 98, 0.28); background: rgba(211, 173, 98, 0.08); color: var(--amber); }
 
 .editor-actions kbd {
   padding: 1px 3px;
@@ -1445,6 +1488,16 @@ kbd,
 
 .code-line:hover { background: rgba(255, 255, 255, 0.025); }
 .changed-line { background: rgba(211, 173, 98, 0.05); }
+.code-line.is-agent-edit { animation: agent-edit-land 1.8s ease-out both; box-shadow: inset 2px 0 var(--amber); }
+
+@keyframes agent-edit-land {
+  0%, 45% { background: rgba(211, 173, 98, 0.14); }
+  100% { background: rgba(211, 173, 98, 0.035); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .code-line.is-agent-edit { animation: none; background: rgba(211, 173, 98, 0.07); }
+}
 
 .line-number {
   padding-right: 12px;

@@ -11,7 +11,7 @@ _Traceframe 0.3 running as a native macOS application with a real local reposito
 | Status | Capability |
 | --- | --- |
 | Implemented | Native macOS shell; draggable and resizable persistent dock tabs; authorized workspace picker; bounded file tree; editable UTF-8 file preview with conflict detection; Git status, diffs, and branch switching; persisted sessions, messages, scoped memories, summaries, and runtime events |
-| Implemented | Traceframe-owned Responses API agent loop with streamed output, cancellation, up to 16 root tool rounds followed by a tools-disabled final synthesis, file and Git tools, bounded development commands, timing, usage, and file-change events |
+| Implemented | Traceframe-owned Responses API agent loop with streamed output, cancellation, queued follow-up turns, up to 16 root tool rounds followed by a tools-disabled final synthesis, file and Git tools, bounded development commands, timing, usage, and line-aware file-change events |
 | Implemented | Model-directed serial delegation to as many as four bounded child agents per run, with inherited provider/model/workspace scope, non-recursive child tools, and visible parent/child events |
 | Implemented | Direct OpenAI Responses, local CC Switch Responses routing, Anthropic streaming, and OpenAI-compatible chat providers; provider health checks and model discovery |
 | Planned | Isolated child worktrees, conflict-aware merge queues, per-agent configuration, authoritative context budgets, and interactive terminal input |
@@ -43,8 +43,8 @@ Every main surface is a dock tab and can be rearranged and resized. Layouts pers
 | Area | Current behavior |
 | --- | --- |
 | Sessions | Create, search, archive, restore, and persist task history |
-| Conversation | Stream model output and stop active runs |
-| Code | Preview, edit, save, revert, and detect conflicting external changes |
+| Conversation | Stream model output, send with Enter, add a line with Shift+Enter, queue and remove follow-up turns during a run, and stop active runs |
+| Code | Preview, edit, save, revert, detect conflicting external changes, and follow agent edits to the current file and changed line range without discarding local drafts |
 | Diff and Git | Inspect staged or unstaged changes and switch existing local branches |
 | Output and trace | Inspect ordered model, tool, file-change, usage, completion, failure, and cancellation events |
 | Context and memory | Review deterministic session summaries and manage session, project, and global memory records |

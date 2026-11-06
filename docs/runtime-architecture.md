@@ -62,7 +62,9 @@ The OpenAI settings include a small reference list from the official current tex
 
 Runtime events contain an event ID, run ID, session ID, per-run sequence number, timestamp, type, and JSON payload. Events are appended to SQLite before they are emitted over the Tauri channel. The desktop restores recent events on startup.
 
-Current events cover run creation, model requests and deltas, tool start/completion/failure, file changes, agent start/completion, usage, completion, cancellation, and failures. Agent and parent-agent IDs provide the current root-to-specialist causal link. A durable general task graph remains planned.
+Current events cover run creation, model requests and deltas, tool start/completion/failure, file changes, agent start/completion, usage, completion, cancellation, and failures. Mutating file tools include a normalized relative path and changed line range in `file.changed`; the renderer uses that evidence to activate Code, load the file, center the range, and mark it once. Manual navigation pauses following, duplicate event IDs are ignored, and unsaved drafts block automatic replacement until they are saved or reverted. Agent and parent-agent IDs provide the current root-to-specialist causal link. A durable general task graph remains planned.
+
+While a run owns the workspace, the conversation remains writable. Follow-up prompts are held in a visible per-session renderer queue and submitted serially after the active run completes. Stopping a run clears that session's pending turns so cancellation cannot unexpectedly start the next item. The queue is process-local; accepted messages and completed run output remain durable in SQLite.
 
 ## Sessions, context, and memory
 

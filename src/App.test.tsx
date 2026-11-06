@@ -15,6 +15,7 @@ import {
   SessionsPanel,
   TopBar,
   activeSessionIdAfterArchive,
+  agentEditTarget,
   firstActiveSessionId,
   isRetiredOpenAiModel,
   providerTestError,
@@ -139,6 +140,48 @@ describe('conversation controls', () => {
     view.rerender(<ConversationPanel session={{ ...activeSession, archived: true }} messages={[]} agents={[]} disabled onSend={onSend} />)
     expect(screen.getByRole('textbox', { name: '发送给主智能体' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled()
+  })
+
+  it('sends with Enter and keeps Shift+Enter for a new line', async () => {
+    const user = userEvent.setup()
+    const onSend = vi.fn().mockResolvedValue(true)
+    render(<ConversationPanel session={activeSession} messages={[]} agents={[]} disabled={false} onSend={onSend} />)
+    const composer = screen.getByRole('textbox', { name: '发送给主智能体' })
+
+    await user.type(composer, 'first line{shift>}{enter}{/shift}second line')
+    expect(composer).toHaveValue('first line\nsecond line')
+    expect(onSend).not.toHaveBeenCalled()
+    await user.type(composer, '{enter}')
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith('first line\nsecond line'))
+    expect(composer).toHaveValue('')
+  })
+
+  it('accepts the next turn during a run and exposes queued messages for removal', async () => {
+    const user = userEvent.setup()
+    const onSend = vi.fn().mockResolvedValue(true)
+    const onRemoveQueued = vi.fn()
+    render(<ConversationPanel
+      session={activeSession}
+      messages={[]}
+      agents={[]}
+      disabled={false}
+      runActive
+      queuedPrompts={[
+        { id: 'queued-1', sessionId: activeSession.id, text: 'Run the integration tests next' },
+        { id: 'queued-2', sessionId: activeSession.id, text: 'Then summarize the failures' },
+      ]}
+      onSend={onSend}
+      onRemoveQueued={onRemoveQueued}
+    />)
+
+    const composer = screen.getByRole('textbox', { name: '发送给主智能体' })
+    expect(composer).toBeEnabled()
+    expect(composer).toHaveAttribute('placeholder', 'Add the next turn to the queue…')
+    expect(screen.getByText('2 queued')).toBeVisible()
+    await user.click(screen.getByRole('button', { name: '移除排队消息 1' }))
+    expect(onRemoveQueued).toHaveBeenCalledWith('queued-1')
+    await user.type(composer, 'Inspect the changed files{enter}')
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith('Inspect the changed files'))
   })
 })
 
@@ -329,6 +372,36 @@ describe('repository interaction lock', () => {
     />)
 
     expect(screen.getByRole('button', { name: 'Choose another folder' })).toBeDisabled()
+  })
+
+  it('keeps file navigation available while an agent run owns write actions', async () => {
+    const user = userEvent.setup()
+    const onSelectFile = vi.fn()
+    render(<RepositoryDock
+      mode="code"
+      branchBusy={false}
+      interactionBusy
+      workspace={workspace}
+      selectedFile=""
+      file={null}
+      diff=""
+      loading={false}
+      fileLoading={false}
+      error={null}
+      fileError={null}
+      diffError={null}
+      onSelectFile={onSelectFile}
+      onRefresh={vi.fn()}
+      onOpenWorkspace={vi.fn()}
+      editor={{
+        mode: 'view', draft: '', draftPath: '', dirty: false, saving: false, error: null, canEdit: false,
+        onMode: vi.fn(), onDraft: vi.fn(), onSave: vi.fn(), onRevert: vi.fn(),
+      }}
+    />)
+
+    await user.click(screen.getByRole('button', { name: /App\.tsx/ }))
+    expect(onSelectFile).toHaveBeenCalledWith('src/App.tsx')
+    expect(screen.getByRole('button', { name: '刷新工作区' })).toBeDisabled()
   })
 
   it('refreshes, collapses, expands, and selects explorer entries', async () => {
@@ -624,5 +697,117 @@ describe('narrow editor toolbar', () => {
     expect(onDraft).toHaveBeenCalled()
     expect(onRevert).toHaveBeenCalledTimes(1)
     expect(onSave).toHaveBeenCalledTimes(1)
+  })
+
+  it('scrolls to each new agent edit and exposes a working follow control', async () => {
+    const scrollIntoView = vi.fn()
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: scrollIntoView })
+    const onFollowAgent = vi.fn()
+    const file = { path: 'src/App.tsx', content: 'one\ntwo\nthree', size: 13, truncated: false }
+    const view = render(<CodeView
+      file={file}
+      loading={false}
+      error={null}
+      mode="view"
+      draft={file.content}
+      draftPath={file.path}
+      dirty={false}
+      saving={false}
+      saveError={null}
+      canEdit={false}
+      agentEdit={{ path: file.path, startLine: 2, endLine: 2, eventId: 'change-1' }}
+      followAgent
+      followBlocked={false}
+      onMode={vi.fn()}
+      onDraft={vi.fn()}
+      onSave={vi.fn()}
+      onRevert={vi.fn()}
+      onFollowAgent={onFollowAgent}
+    />)
+
+    await waitFor(() => expect(view.container.querySelector('[data-line="2"]')).toHaveClass('is-agent-edit'))
+    expect(scrollIntoView).toHaveBeenCalledTimes(1)
+    view.rerender(<CodeView
+      file={file}
+      loading={false}
+      error={null}
+      mode="view"
+      draft={file.content}
+      draftPath={file.path}
+      dirty={false}
+      saving={false}
+      saveError={null}
+      canEdit={false}
+      agentEdit={{ path: file.path, startLine: 3, endLine: 3, eventId: 'change-2' }}
+      followAgent
+      followBlocked={false}
+      onMode={vi.fn()}
+      onDraft={vi.fn()}
+      onSave={vi.fn()}
+      onRevert={vi.fn()}
+      onFollowAgent={onFollowAgent}
+    />)
+    await waitFor(() => expect(view.container.querySelector('[data-line="3"]')).toHaveClass('is-agent-edit'))
+    expect(scrollIntoView).toHaveBeenCalledTimes(2)
+    await userEvent.click(screen.getByRole('button', { name: /Following/ }))
+    expect(onFollowAgent).toHaveBeenCalledWith(false)
+  })
+
+  it('selects the changed range in edit mode without replacing the draft', async () => {
+    const commonProps = {
+      file: { path: 'note.txt', content: 'alpha\nbeta\ngamma', size: 16, truncated: false },
+      loading: false,
+      error: null,
+      mode: 'edit' as const,
+      draftPath: 'note.txt',
+      dirty: true,
+      saving: false,
+      saveError: null,
+      canEdit: true,
+      agentEdit: { path: 'note.txt', startLine: 2, endLine: 2, eventId: 'edit-1' },
+      followAgent: true,
+      followBlocked: true,
+      onMode: vi.fn(),
+      onDraft: vi.fn(),
+      onSave: vi.fn(),
+      onRevert: vi.fn(),
+      onFollowAgent: vi.fn(),
+    }
+    const view = render(<CodeView
+      {...commonProps}
+      draft={'alpha\nlocal beta\ngamma'}
+    />)
+
+    const editor = screen.getByRole('textbox', { name: '编辑 note.txt' }) as HTMLTextAreaElement
+    await waitFor(() => expect(editor.selectionStart).toBe(6))
+    expect(editor.selectionEnd).toBe(16)
+    expect(editor).toHaveValue('alpha\nlocal beta\ngamma')
+    expect(screen.getByRole('button', { name: /Blocked/ })).toHaveAttribute('aria-pressed', 'true')
+
+    view.rerender(<CodeView {...commonProps} draft={'alpha\nlocal beta!\ngamma'} />)
+    editor.setSelectionRange(0, 0)
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())))
+    expect(editor.selectionStart).toBe(0)
+    expect(editor.selectionEnd).toBe(0)
+  })
+})
+
+describe('agent edit event validation', () => {
+  const event = (payload: Record<string, unknown>) => ({
+    id: 'event-1', sessionId: 'session-1', runId: 'run-1', sequence: 1,
+    type: 'file.changed', payload, timestamp: Date.now(),
+  })
+
+  it('uses a safe first-line fallback when older runtimes omit line metadata', () => {
+    expect(agentEditTarget(event({ path: 'src/App.tsx' }))).toEqual({
+      path: 'src/App.tsx', startLine: 1, endLine: 1, eventId: 'event-1',
+    })
+    expect(agentEditTarget(event({ path: ' notes.txt ' }))?.path).toBe(' notes.txt ')
+  })
+
+  it('rejects absolute and parent-traversal paths', () => {
+    expect(agentEditTarget(event({ path: '../secret.txt', startLine: 4 }))).toBeNull()
+    expect(agentEditTarget(event({ path: '/tmp/secret.txt', startLine: 4 }))).toBeNull()
+    expect(agentEditTarget(event({ path: 'src\\secret.txt', startLine: 4 }))).toBeNull()
   })
 })
