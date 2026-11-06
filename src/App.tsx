@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react'
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   Archive,
@@ -18,6 +18,7 @@ import {
   File,
   FileCode2,
   Files,
+  FolderOpen,
   GitCompareArrows,
   GitFork,
   HardDrive,
@@ -30,6 +31,7 @@ import {
   PanelRight,
   Play,
   Plus,
+  RefreshCw,
   Search,
   Send,
   Settings,
@@ -42,8 +44,6 @@ import {
   Zap,
 } from 'lucide-react'
 import {
-  codeLines,
-  diffLines,
   initialAgents,
   initialMessages,
   initialProviders,
@@ -52,11 +52,26 @@ import {
 import type { Agent, Message, Provider, Session } from './types'
 import {
   getCcSwitchStatus,
+  getGitDiff,
+  getGitSnapshot,
   getNativeCapabilities,
+  getRecentWorkspace,
+  getWorkspaceTree,
   isDesktopRuntime,
+  listGitBranches,
+  pickWorkspace,
+  readWorkspaceFile,
+  switchGitBranch,
   type CcSwitchStatus,
+  type GitSnapshot,
   type NativeCapabilities,
+  type WorkspaceFile,
+  type WorkspaceTreeEntry,
 } from './native'
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
+}
 
 type WorkspaceTab = 'code' | 'diff' | 'terminal' | 'activity'
 type InspectorTab = 'context' | 'agents' | 'memory'
@@ -72,6 +87,15 @@ const defaultUiPreferences: UiPreferences = {
   theme: 'graphite',
   density: 'compact',
   layout: 'balanced',
+}
+
+interface WorkspaceView {
+  path: string
+  name: string
+  snapshot: GitSnapshot
+  branches: string[]
+  tree: WorkspaceTreeEntry[]
+  treeTruncated: boolean
 }
 
 const IconButton = ({
@@ -97,16 +121,26 @@ const IconButton = ({
 )
 
 function TopBar({
+  workspace,
   branch,
-  setBranch,
+  branches,
+  branchBusy,
+  workspaceLoading,
+  onBranch,
+  onOpenWorkspace,
   model,
   setModel,
   runState,
   onRun,
   onSettings,
 }: {
+  workspace: WorkspaceView | null
   branch: string
-  setBranch: (value: string) => void
+  branches: string[]
+  branchBusy: boolean
+  workspaceLoading: boolean
+  onBranch: (value: string) => void
+  onOpenWorkspace: () => void
   model: string
   setModel: (value: string) => void
   runState: 'idle' | 'running'
@@ -122,12 +156,18 @@ function TopBar({
           <span />
         </div>
         <span className="brand-name">Traceframe</span>
-        <span className="version">0.1</span>
+        <span className="version">0.2</span>
       </div>
 
-      <button className="project-switcher" type="button">
-        <HardDrive size={16} />
-        <span>acme / console</span>
+      <button
+        className={`project-switcher${workspace ? '' : ' is-empty'}`}
+        type="button"
+        onClick={onOpenWorkspace}
+        disabled={workspaceLoading || branchBusy}
+        title={workspace?.path ?? 'Open a local workspace'}
+      >
+        {workspace ? <HardDrive size={16} /> : <FolderOpen size={16} />}
+        <span>{workspace?.name ?? 'Open workspace'}</span>
         <ChevronDown size={14} />
       </button>
 
@@ -136,11 +176,8 @@ function TopBar({
       <label className="compact-select branch-select">
         <GitFork size={15} />
         <span className="sr-only">当前分支</span>
-        <select value={branch} onChange={(event) => setBranch(event.target.value)}>
-          <option value="feat/auth-v2">feat/auth-v2</option>
-          <option value="main">main</option>
-          <option value="perf/dashboard">perf/dashboard</option>
-          <option value="fix/stripe-hook">fix/stripe-hook</option>
+        <select value={branch} disabled={!workspace || branchBusy || workspaceLoading} onChange={(event) => onBranch(event.target.value)}>
+          {branches.length ? branches.map((item) => <option value={item} key={item}>{item}</option>) : <option value={branch}>{branch}</option>}
         </select>
       </label>
 
@@ -190,11 +227,15 @@ function AppRail({ inspectorTab, setInspectorTab }: { inspectorTab: InspectorTab
 function SessionsPanel({
   sessions,
   activeId,
+  branchCount,
+  changeCount,
   onSelect,
   onNew,
 }: {
   sessions: Session[]
   activeId: string
+  branchCount: number
+  changeCount: number
   onSelect: (session: Session) => void
   onNew: () => void
 }) {
@@ -245,8 +286,8 @@ function SessionsPanel({
         <div className="repo-state">
           <span className="repo-icon"><GitFork size={15} /></span>
           <span>
-            <strong>4 branches</strong>
-            <small>2 worktrees active</small>
+            <strong>{branchCount ? `${branchCount} branches` : 'No workspace'}</strong>
+            <small>{changeCount ? `${changeCount} changed files` : branchCount ? 'Working tree clean' : 'Open a local repository'}</small>
           </span>
         </div>
         <ChevronRight size={15} />
@@ -341,54 +382,111 @@ function ConversationPanel({ messages, onSend }: { messages: Message[]; onSend: 
   )
 }
 
-const files = [
-  { name: 'app', type: 'folder', depth: 0, open: true },
-  { name: 'api', type: 'folder', depth: 1, open: true },
-  { name: 'auth', type: 'folder', depth: 2, open: true },
-  { name: 'refresh', type: 'folder', depth: 3, open: true },
-  { name: 'route.ts', type: 'file', depth: 4, status: 'M' },
-  { name: 'lib', type: 'folder', depth: 0, open: true },
-  { name: 'auth', type: 'folder', depth: 1, open: true },
-  { name: 'token.ts', type: 'file', depth: 2, status: 'M' },
-  { name: 'client.ts', type: 'file', depth: 2, status: 'M' },
-  { name: 'refresh.test.ts', type: 'file', depth: 2, status: 'A' },
-  { name: 'middleware.ts', type: 'file', depth: 0 },
-]
+function fileStatus(snapshot: GitSnapshot, path: string) {
+  const state = snapshot.files.find((file) => file.path === path)
+  if (!state) return undefined
+  const status = state.worktreeStatus !== ' ' ? state.worktreeStatus : state.indexStatus
+  return status === '?' ? 'U' : status
+}
 
-function FileTree({ selected, onSelect }: { selected: string; onSelect: (name: string) => void }) {
+function FileTree({
+  workspace,
+  selected,
+  loading,
+  onSelect,
+  onRefresh,
+  onOpen,
+}: {
+  workspace: WorkspaceView | null
+  selected: string
+  loading: boolean
+  onSelect: (name: string) => void
+  onRefresh: () => void
+  onOpen: () => void
+}) {
+  const knownPaths = new Set(workspace?.tree.map((item) => item.path) ?? [])
+  const changedOnly = workspace?.snapshot.files
+    .filter((item) => !knownPaths.has(item.path))
+    .map((item): WorkspaceTreeEntry => ({
+      path: item.path,
+      name: item.path,
+      kind: 'file',
+      depth: 0,
+    })) ?? []
+  const visibleTree = [...changedOnly, ...(workspace?.tree ?? [])]
+
   return (
     <aside className="file-tree">
       <div className="file-tree-head">
         <span>Explorer</span>
-        <span className="file-change-summary"><b>+86</b><i>−24</i></span>
-      </div>
-      <div className="tree-root"><ChevronDown size={13} />acme-console</div>
-      <div className="file-list">
-        {files.map((item, index) => (
-          <button
-            key={`${item.name}-${index}`}
-            type="button"
-            className={`file-row${selected === item.name && item.type === 'file' ? ' is-active' : ''}`}
-            style={{ '--depth': item.depth } as React.CSSProperties}
-            onClick={() => item.type === 'file' && onSelect(item.name)}
-          >
-            {item.type === 'folder' ? <ChevronDown size={12} /> : <span className="file-indent" />}
-            {item.type === 'folder' ? <span className="folder-icon"><ChevronRight size={13} /></span> : <FileCode2 size={14} />}
-            <span>{item.name}</span>
-            {item.status ? <b className={`file-status status-${item.status.toLowerCase()}`}>{item.status}</b> : null}
+        {workspace ? (
+          <button type="button" className="tree-refresh" onClick={onRefresh} disabled={loading} aria-label="刷新工作区" title="刷新工作区">
+            <RefreshCw size={13} className={loading ? 'is-spinning' : ''} />
           </button>
-        ))}
+        ) : null}
+      </div>
+      <div className="tree-root">
+        {workspace ? <ChevronDown size={13} /> : <FolderOpen size={13} />}
+        <span>{workspace?.name ?? 'No workspace'}</span>
+      </div>
+      <div className="file-list">
+        {!workspace ? (
+          <div className="tree-empty">
+            <p>Select a local Git repository to inspect its files and changes.</p>
+            <button type="button" onClick={onOpen}><FolderOpen size={14} />Open folder</button>
+          </div>
+        ) : null}
+        {workspace?.treeTruncated ? <div className="tree-limit">Explorer limited to 800 entries. Changed files are listed first.</div> : null}
+        {changedOnly.length ? <div className="tree-changed-label">Changed outside explorer</div> : null}
+        {visibleTree.map((item) => {
+          const status = item.kind === 'file' && workspace ? fileStatus(workspace.snapshot, item.path) : undefined
+          if (item.kind === 'directory') {
+            return (
+              <div
+                key={item.path}
+                className="file-row is-directory"
+                style={{ '--depth': item.depth } as React.CSSProperties}
+                title={item.path}
+              >
+                <span className="file-indent" />
+                <span className="folder-icon"><FolderOpen size={13} /></span>
+                <span>{item.name}</span>
+              </div>
+            )
+          }
+          return (
+          <button
+            key={item.path}
+            type="button"
+            className={`file-row${selected === item.path ? ' is-active' : ''}`}
+            style={{ '--depth': item.depth } as React.CSSProperties}
+            onClick={() => onSelect(item.path)}
+            title={item.path}
+          >
+            <span className="file-indent" />
+            <FileCode2 size={14} />
+            <span>{item.name}</span>
+            {status ? <b className={`file-status status-${status.toLowerCase()}`}>{status}</b> : null}
+          </button>
+          )
+        })}
       </div>
     </aside>
   )
 }
 
-function CodeView() {
+function CodeView({ file, loading, error }: { file: WorkspaceFile | null; loading: boolean; error: string | null }) {
+  if (loading) return <div className="workspace-empty"><RefreshCw className="is-spinning" size={18} /><strong>Reading file</strong></div>
+  if (error) return <div className="workspace-empty is-error"><File size={18} /><strong>Preview unavailable</strong><p>{error}</p></div>
+  if (!file) return <div className="workspace-empty"><FileCode2 size={18} /><strong>Select a file</strong><p>Code and diffs stay tied to the selected workspace.</p></div>
+
+  const lines = file.content.split('\n')
   return (
     <div className="code-view" role="region" aria-label="代码编辑器">
-      {codeLines.map(([number, line]) => (
-        <div className={`code-line${['15', '16', '17', '18', '19', '20', '21'].includes(number) ? ' changed-line' : ''}`} key={number}>
-          <span className="line-number">{number}</span>
+      {file.truncated ? <div className="file-preview-note">Preview limited for responsiveness · source size {(file.size / 1024).toFixed(0)} KB</div> : null}
+      {lines.map((line, index) => (
+        <div className="code-line" key={`${index}-${line.slice(0, 16)}`}>
+          <span className="line-number">{index + 1}</span>
           <code>{line || ' '}</code>
         </div>
       ))}
@@ -396,18 +494,68 @@ function CodeView() {
   )
 }
 
-function DiffView() {
+interface ParsedDiffLine {
+  type: 'context' | 'add' | 'remove' | 'meta'
+  old: string
+  next: string
+  text: string
+}
+
+function parseUnifiedDiff(diff: string): ParsedDiffLine[] {
+  let oldLine = 0
+  let nextLine = 0
+  let inHunk = false
+
+  return diff.split('\n').filter((line, index, lines) => line || index < lines.length - 1).map((line) => {
+    const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
+    if (hunk) {
+      oldLine = Number(hunk[1])
+      nextLine = Number(hunk[2])
+      inHunk = true
+      return { type: 'meta', old: '', next: '', text: line }
+    }
+    if (!inHunk || line.startsWith('diff --git') || line.startsWith('index ') || line.startsWith('--- ') || line.startsWith('+++ ') || line.startsWith('\\ ')) {
+      return { type: 'meta', old: '', next: '', text: line }
+    }
+    if (line.startsWith('+')) {
+      const parsed = { type: 'add' as const, old: '', next: String(nextLine), text: line.slice(1) }
+      nextLine += 1
+      return parsed
+    }
+    if (line.startsWith('-')) {
+      const parsed = { type: 'remove' as const, old: String(oldLine), next: '', text: line.slice(1) }
+      oldLine += 1
+      return parsed
+    }
+    const parsed = { type: 'context' as const, old: String(oldLine), next: String(nextLine), text: line.startsWith(' ') ? line.slice(1) : line }
+    oldLine += 1
+    nextLine += 1
+    return parsed
+  })
+}
+
+function DiffView({ diff, path, loading, error }: { diff: string; path: string; loading: boolean; error: string | null }) {
+  const lines = useMemo(() => parseUnifiedDiff(diff), [diff])
+  const additions = lines.filter((line) => line.type === 'add').length
+  const deletions = lines.filter((line) => line.type === 'remove').length
+
+  if (loading) return <div className="workspace-empty"><RefreshCw className="is-spinning" size={18} /><strong>Reading diff</strong></div>
+  if (!path) return <div className="workspace-empty"><GitCompareArrows size={18} /><strong>Select a changed file</strong></div>
+  if (error && !diff.trim()) return <div className="workspace-empty is-error"><GitCompareArrows size={18} /><strong>Diff unavailable</strong><p>{error}</p></div>
+  if (!diff.trim()) return <div className="workspace-empty"><Check size={18} /><strong>No tracked diff</strong><p>The file is clean or currently untracked.</p></div>
+
   return (
     <div className="diff-view" role="region" aria-label="代码差异">
+      {error ? <div className="diff-error-note">Partial diff · {error}</div> : null}
       <div className="diff-file-head">
-        <span>src/auth/client.ts</span>
-        <span><b>+7</b><i>−3</i></span>
+        <span>{path}</span>
+        <span><b>+{additions}</b><i>−{deletions}</i></span>
       </div>
-      {diffLines.map((line, index) => (
-        <div className={`diff-line diff-${line.type}`} key={`${line.old}-${line.next}-${index}`}>
+      {lines.map((line, index) => (
+        <div className={`diff-line diff-${line.type}`} key={`${line.old}-${line.next}-${index}-${line.text.slice(0, 12)}`}>
           <span className="diff-gutter">{line.old}</span>
           <span className="diff-gutter">{line.next}</span>
-          <span className="diff-symbol">{line.type === 'add' ? '+' : line.type === 'remove' ? '−' : ' '}</span>
+          <span className="diff-symbol">{line.type === 'add' ? '+' : line.type === 'remove' ? '−' : line.type === 'meta' ? '·' : ' '}</span>
           <code>{line.text || ' '}</code>
         </div>
       ))}
@@ -415,16 +563,14 @@ function DiffView() {
   )
 }
 
-function TerminalView({ runState }: { runState: 'idle' | 'running' }) {
+function TerminalView({ runState, workspace, branch }: { runState: 'idle' | 'running'; workspace: WorkspaceView | null; branch: string }) {
   return (
     <div className="terminal-view" role="log" aria-live="polite">
-      <div><span className="prompt">trace@feat/auth-v2</span><span className="terminal-path"> ~/acme-console</span> pnpm test auth --runInBand</div>
-      <div className="terminal-muted"> RUN  v2.1.8 /workspace/acme-console</div>
-      <div className="terminal-pass"> ✓ src/auth/refresh.test.ts (8 tests) 418ms</div>
-      <div className="terminal-pass"> ✓ src/lib/auth/token.test.ts (12 tests) 622ms</div>
-      <div className="terminal-muted"> Test Files  2 passed (2)</div>
-      <div className="terminal-muted"> Tests       20 passed (20)</div>
-      {runState === 'running' ? <div className="terminal-active">› Running integration/auth-concurrency.test.ts…</div> : <div><span className="prompt">trace@feat/auth-v2</span><span className="cursor-block" /></div>}
+      <div><span className="prompt">trace@{branch}</span><span className="terminal-path"> {workspace?.path ?? '~'}</span> git status --short</div>
+      {workspace?.snapshot.files.length ? workspace.snapshot.files.map((file) => (
+        <div className="terminal-muted" key={file.path}> {file.indexStatus}{file.worktreeStatus} {file.path}</div>
+      )) : <div className="terminal-pass"> ✓ Working tree clean</div>}
+      {runState === 'running' ? <div className="terminal-active">› Agent run is active; tool output will stream here.</div> : <div><span className="prompt">trace@{branch}</span><span className="cursor-block" /></div>}
     </div>
   )
 }
@@ -447,19 +593,54 @@ function ActivityView({ agents }: { agents: Agent[] }) {
   )
 }
 
-function CodeWorkspace({ agents, runState }: { agents: Agent[]; runState: 'idle' | 'running' }) {
+function CodeWorkspace({
+  agents,
+  runState,
+  branch,
+  workspace,
+  selectedFile,
+  file,
+  diff,
+  loading,
+  fileLoading,
+  error,
+  fileError,
+  diffError,
+  onSelectFile,
+  onRefresh,
+  onOpenWorkspace,
+}: {
+  agents: Agent[]
+  runState: 'idle' | 'running'
+  branch: string
+  workspace: WorkspaceView | null
+  selectedFile: string
+  file: WorkspaceFile | null
+  diff: string
+  loading: boolean
+  fileLoading: boolean
+  error: string | null
+  fileError: string | null
+  diffError: string | null
+  onSelectFile: (path: string) => void
+  onRefresh: () => void
+  onOpenWorkspace: () => void
+}) {
   const [tab, setTab] = useState<WorkspaceTab>('diff')
-  const [selectedFile, setSelectedFile] = useState('route.ts')
+  const diffLines = useMemo(() => parseUnifiedDiff(diff), [diff])
+  const additions = diffLines.filter((line) => line.type === 'add').length
+  const deletions = diffLines.filter((line) => line.type === 'remove').length
+  const breadcrumbs = selectedFile.split('/').filter(Boolean)
 
   const tabs: { id: WorkspaceTab; label: string; icon: React.ReactNode; count?: string }[] = [
     { id: 'code', label: 'Code', icon: <Code2 size={15} /> },
-    { id: 'diff', label: 'Diff', icon: <GitCompareArrows size={15} />, count: '4' },
+    { id: 'diff', label: 'Diff', icon: <GitCompareArrows size={15} />, count: workspace ? String(workspace.snapshot.files.length) : undefined },
     { id: 'terminal', label: 'Terminal', icon: <SquareTerminal size={15} /> },
     { id: 'activity', label: 'Trace', icon: <Activity size={15} /> },
   ]
 
   return (
-    <section className="code-workspace" aria-label="实时开发工作区">
+    <section className={`code-workspace${error ? ' has-error' : ''}`} aria-label="实时开发工作区">
       <div className="workspace-tabs" role="tablist" aria-label="开发视图">
         {tabs.map((item) => (
           <button
@@ -474,22 +655,34 @@ function CodeWorkspace({ agents, runState }: { agents: Agent[]; runState: 'idle'
           </button>
         ))}
         <div className="workspace-tab-spacer" />
-        <div className="change-stat"><span className="insertions">+86</span><span className="deletions">−24</span></div>
+        <div className="change-stat"><span className="insertions">+{additions}</span><span className="deletions">−{deletions}</span></div>
         <IconButton label="拆分编辑器"><Split size={16} /></IconButton>
       </div>
 
+      {error ? <div className="workspace-error"><span>{error}</span><button type="button" onClick={onOpenWorkspace}>Choose another folder</button></div> : null}
+
       <div className="editor-layout">
-        <FileTree selected={selectedFile} onSelect={setSelectedFile} />
+        <FileTree
+          workspace={workspace}
+          selected={selectedFile}
+          loading={loading}
+          onSelect={onSelectFile}
+          onRefresh={onRefresh}
+          onOpen={onOpenWorkspace}
+        />
         <div className="editor-main">
           <div className="editor-breadcrumb">
-            <span>acme-console</span><ChevronRight size={12} /><span>src</span><ChevronRight size={12} /><span>auth</span><ChevronRight size={12} /><strong>{selectedFile}</strong>
+            <span>{workspace?.name ?? 'Workspace'}</span>
+            {breadcrumbs.map((part, index) => (
+              <span className="breadcrumb-part" key={`${part}-${index}`}><ChevronRight size={12} />{index === breadcrumbs.length - 1 ? <strong>{part}</strong> : <span>{part}</span>}</span>
+            ))}
             <div className="editor-breadcrumb-spacer" />
-          <span className="editing-agent"><span />Forge editing</span>
+            <span className="editing-agent"><span />{workspace ? loading ? 'Refreshing' : 'Local workspace' : 'No workspace'}</span>
           </div>
           <div className="editor-content">
-            {tab === 'code' ? <CodeView /> : null}
-            {tab === 'diff' ? <DiffView /> : null}
-            {tab === 'terminal' ? <TerminalView runState={runState} /> : null}
+            {tab === 'code' ? <CodeView file={file} loading={fileLoading} error={fileError} /> : null}
+            {tab === 'diff' ? <DiffView diff={diff} path={selectedFile} loading={fileLoading} error={diffError} /> : null}
+            {tab === 'terminal' ? <TerminalView runState={runState} workspace={workspace} branch={branch} /> : null}
             {tab === 'activity' ? <ActivityView agents={agents} /> : null}
           </div>
         </div>
@@ -677,7 +870,7 @@ function ProviderSettings({
     }, 650)
   }
 
-  const connectCcSwitch = () => {
+  const importCcSwitch = () => {
     if (!ccSwitch) return
     const provider: Provider = {
       id: 'ccswitch',
@@ -718,7 +911,7 @@ function ProviderSettings({
                     <h3>CC Switch</h3>
                     <span>{ccSwitch ? `${ccSwitch.providers.length} providers · proxy ${ccSwitch.proxyEnabled ? 'online' : 'offline'}` : isDesktopRuntime() ? 'Detecting local runtime' : 'Available in desktop app'}</span>
                   </div>
-                  <button type="button" onClick={connectCcSwitch} disabled={!ccSwitch?.databaseFound}>{draft.some((item) => item.id === 'ccswitch') ? 'Refresh' : 'Connect'}</button>
+                  <button type="button" onClick={importCcSwitch} disabled={!ccSwitch?.databaseFound}>{draft.some((item) => item.id === 'ccswitch') ? 'Update' : 'Import'}</button>
                 </div>
                 {ccSwitch?.providers.some((provider) => provider.isCurrent) ? (
                   <div className="ccswitch-routes">
@@ -786,15 +979,26 @@ function ProviderSettings({
   )
 }
 
-function StatusBar({ branch, model, native }: { branch: string; model: string; native: NativeCapabilities | null }) {
+function StatusBar({
+  branch,
+  model,
+  native,
+  workspace,
+}: {
+  branch: string
+  model: string
+  native: NativeCapabilities | null
+  workspace: WorkspaceView | null
+}) {
   return (
     <footer className="statusbar">
       <span><GitFork size={12} />{branch}</span>
-      <span><CircleDot size={12} />4 modified</span>
-      <span><Check size={12} />20 tests</span>
+      <span><CircleDot size={12} />{workspace ? `${workspace.snapshot.files.length} changed` : 'No repository'}</span>
+      {workspace?.snapshot.ahead ? <span>↑ {workspace.snapshot.ahead}</span> : null}
+      {workspace?.snapshot.behind ? <span>↓ {workspace.snapshot.behind}</span> : null}
       <span className="status-spacer" />
       <span>UTF-8</span>
-      <span>TypeScript</span>
+      <span>{workspace?.name ?? 'Traceframe'}</span>
       <span><Cpu size={12} />{model}</span>
       <span className="status-connected"><span />{native ? `${native.platform} native` : 'UI preview'}</span>
     </footer>
@@ -806,27 +1010,127 @@ export default function App() {
   const [activeSessionId, setActiveSessionId] = useState('s1')
   const [messages, setMessages] = useState(initialMessages)
   const [agents, setAgents] = useState(initialAgents)
-  const [branch, setBranch] = useState('feat/auth-v2')
+  const [branch, setBranch] = useState('main')
   const [model, setModel] = useState('Claude Sonnet 4.5')
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('context')
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const [runState, setRunState] = useState<'idle' | 'running'>('running')
+  const [runState, setRunState] = useState<'idle' | 'running'>('idle')
   const [providers, setProviders] = useState<Provider[]>(() => {
     const stored = localStorage.getItem('traceframe.providers')
     if (!stored) return initialProviders
     try { return JSON.parse(stored) as Provider[] } catch { return initialProviders }
   })
   const [native, setNative] = useState<NativeCapabilities | null>(null)
+  const [workspace, setWorkspace] = useState<WorkspaceView | null>(null)
+  const [workspaceLoading, setWorkspaceLoading] = useState(false)
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null)
+  const [selectedFile, setSelectedFile] = useState('')
+  const [workspaceFile, setWorkspaceFile] = useState<WorkspaceFile | null>(null)
+  const [workspaceDiff, setWorkspaceDiff] = useState('')
+  const [fileLoading, setFileLoading] = useState(false)
+  const [fileError, setFileError] = useState<string | null>(null)
+  const [diffError, setDiffError] = useState<string | null>(null)
+  const [branchBusy, setBranchBusy] = useState(false)
+  const workspaceRequest = useRef(0)
+  const fileRequest = useRef(0)
   const [preferences, setPreferences] = useState<UiPreferences>(() => {
     const stored = localStorage.getItem('traceframe.appearance')
     if (!stored) return defaultUiPreferences
     try { return { ...defaultUiPreferences, ...JSON.parse(stored) as UiPreferences } } catch { return defaultUiPreferences }
   })
 
+  const loadWorkspaceFile = useCallback(async (workspacePath: string, path: string) => {
+    const request = ++fileRequest.current
+    setSelectedFile(path)
+    setFileLoading(true)
+    setFileError(null)
+    setDiffError(null)
+
+    const [fileResult, stagedDiff, workingDiff] = await Promise.allSettled([
+      readWorkspaceFile(workspacePath, path),
+      getGitDiff(workspacePath, true, path),
+      getGitDiff(workspacePath, false, path),
+    ])
+    if (request !== fileRequest.current) return
+
+    if (fileResult.status === 'fulfilled') {
+      setWorkspaceFile(fileResult.value)
+    } else {
+      setWorkspaceFile(null)
+      setFileError(errorMessage(fileResult.reason))
+    }
+    setWorkspaceDiff([
+      stagedDiff.status === 'fulfilled' ? stagedDiff.value : '',
+      workingDiff.status === 'fulfilled' ? workingDiff.value : '',
+    ].filter(Boolean).join('\n'))
+    const diffFailures = [stagedDiff, workingDiff]
+      .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+      .map((result) => errorMessage(result.reason))
+    setDiffError([...new Set(diffFailures)].join(' · ') || null)
+    setFileLoading(false)
+  }, [])
+
+  const loadWorkspace = useCallback(async (path: string, preferredFile = '') => {
+    const request = ++workspaceRequest.current
+    fileRequest.current += 1
+    setWorkspaceLoading(true)
+    setWorkspaceError(null)
+    setFileLoading(false)
+    setFileError(null)
+    setDiffError(null)
+
+    try {
+      const [snapshot, branches, tree] = await Promise.all([
+        getGitSnapshot(path),
+        listGitBranches(path),
+        getWorkspaceTree(path),
+      ])
+      if (request !== workspaceRequest.current) return
+
+      const name = path.split(/[\\/]/).filter(Boolean).at(-1) ?? path
+      const nextWorkspace = { path, name, snapshot, branches, tree: tree.entries, treeTruncated: tree.truncated }
+      setWorkspace(nextWorkspace)
+      setBranch(snapshot.branch)
+
+      const files = tree.entries.filter((entry) => entry.kind === 'file')
+      const nextFile = files.some((entry) => entry.path === preferredFile)
+        ? preferredFile
+        : snapshot.files[0]?.path ?? files[0]?.path ?? ''
+      if (nextFile) {
+        await loadWorkspaceFile(path, nextFile)
+      } else {
+        setSelectedFile('')
+        setWorkspaceFile(null)
+        setWorkspaceDiff('')
+        setFileError(null)
+        setDiffError(null)
+      }
+    } catch (error) {
+      if (request !== workspaceRequest.current) return
+      fileRequest.current += 1
+      setWorkspace(null)
+      setSelectedFile('')
+      setWorkspaceFile(null)
+      setWorkspaceDiff('')
+      setFileLoading(false)
+      setFileError(null)
+      setDiffError(null)
+      setWorkspaceError(errorMessage(error) || 'The selected folder could not be opened')
+    } finally {
+      if (request === workspaceRequest.current) setWorkspaceLoading(false)
+    }
+  }, [loadWorkspaceFile])
+
   useEffect(() => {
     document.documentElement.classList.toggle('tauri-desktop', isDesktopRuntime())
-    if (isDesktopRuntime()) getNativeCapabilities().then(setNative).catch(() => setNative(null))
-  }, [])
+    if (!isDesktopRuntime()) return
+    getNativeCapabilities().then(setNative).catch(() => setNative(null))
+    getRecentWorkspace()
+      .then((recentWorkspace) => {
+        if (recentWorkspace) return loadWorkspace(recentWorkspace)
+      })
+      .catch(() => undefined)
+  }, [loadWorkspace])
 
   useEffect(() => {
     document.documentElement.dataset.theme = preferences.theme
@@ -837,18 +1141,55 @@ export default function App() {
 
   const activeSession = useMemo(() => sessions.find((session) => session.id === activeSessionId), [sessions, activeSessionId])
 
+  const openWorkspace = async () => {
+    if (!isDesktopRuntime()) {
+      setWorkspaceError('Folder selection is available in the native Traceframe app.')
+      return
+    }
+    try {
+      const selected = await pickWorkspace()
+      if (selected) await loadWorkspace(selected)
+    } catch (error) {
+      setWorkspaceError(errorMessage(error))
+    }
+  }
+
+  const refreshWorkspace = () => {
+    if (workspace) void loadWorkspace(workspace.path, selectedFile)
+  }
+
+  const changeBranch = async (nextBranch: string) => {
+    if (!workspace || nextBranch === branch) return
+    const operation = workspaceRequest.current
+    const workspacePath = workspace.path
+    const previousBranch = branch
+    setBranch(nextBranch)
+    setBranchBusy(true)
+    setWorkspaceError(null)
+    try {
+      await switchGitBranch(workspacePath, nextBranch)
+      if (operation !== workspaceRequest.current) return
+      await loadWorkspace(workspacePath, selectedFile)
+    } catch (error) {
+      if (operation !== workspaceRequest.current) return
+      setBranch(previousBranch)
+      setWorkspaceError(errorMessage(error))
+    } finally {
+      setBranchBusy(false)
+    }
+  }
+
   const selectSession = (session: Session) => {
     setActiveSessionId(session.id)
-    setBranch(session.branch)
+    if (!workspace) setBranch(session.branch)
     setSessions((current) => current.map((item) => ({ ...item, unread: item.id === session.id ? undefined : item.unread })))
   }
 
   const createSession = () => {
     const id = `s${Date.now()}`
-    const newSession: Session = { id, title: 'Untitled task', summary: 'New orchestration thread', time: 'NOW', branch: 'main' }
+    const newSession: Session = { id, title: 'Untitled task', summary: 'New orchestration thread', time: 'NOW', branch }
     setSessions((current) => [newSession, ...current])
     setActiveSessionId(id)
-    setBranch('main')
   }
 
   const sendMessage = (text: string) => {
@@ -876,8 +1217,13 @@ export default function App() {
   return (
     <div className="app-shell">
       <TopBar
+        workspace={workspace}
         branch={branch}
-        setBranch={setBranch}
+        branches={workspace?.branches ?? []}
+        branchBusy={branchBusy}
+        workspaceLoading={workspaceLoading}
+        onBranch={(value) => void changeBranch(value)}
+        onOpenWorkspace={() => void openWorkspace()}
         model={model}
         setModel={setModel}
         runState={runState}
@@ -885,13 +1231,36 @@ export default function App() {
         onSettings={() => setSettingsOpen(true)}
       />
       <AppRail inspectorTab={inspectorTab} setInspectorTab={setInspectorTab} />
-      <SessionsPanel sessions={sessions} activeId={activeSessionId} onSelect={selectSession} onNew={createSession} />
+      <SessionsPanel
+        sessions={sessions}
+        activeId={activeSessionId}
+        branchCount={workspace?.branches.length ?? 0}
+        changeCount={workspace?.snapshot.files.length ?? 0}
+        onSelect={selectSession}
+        onNew={createSession}
+      />
       <main className="main-workspace">
         <ConversationPanel messages={messages} onSend={sendMessage} />
-        <CodeWorkspace agents={agents} runState={runState} />
+        <CodeWorkspace
+          agents={agents}
+          runState={runState}
+          branch={branch}
+          workspace={workspace}
+          selectedFile={selectedFile}
+          file={workspaceFile}
+          diff={workspaceDiff}
+          loading={workspaceLoading}
+          fileLoading={fileLoading}
+          error={workspaceError}
+          fileError={fileError}
+          diffError={diffError}
+          onSelectFile={(path) => workspace && void loadWorkspaceFile(workspace.path, path)}
+          onRefresh={refreshWorkspace}
+          onOpenWorkspace={() => void openWorkspace()}
+        />
       </main>
       <Inspector tab={inspectorTab} setTab={setInspectorTab} agents={agents} />
-      <StatusBar branch={branch} model={model} native={native} />
+      <StatusBar branch={branch} model={model} native={native} workspace={workspace} />
       <ProviderSettings
         open={settingsOpen}
         providers={providers}

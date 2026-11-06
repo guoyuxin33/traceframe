@@ -2,6 +2,20 @@
 
 Traceframe is a desktop workspace for transparent, multi-agent software development. It keeps conversation, tool execution, file changes, Git branches, context compaction, and memory on the same trace.
 
+![Traceframe 0.2 workspace showing live repository files, agent conversation, and context controls](docs/assets/traceframe-workspace.png)
+
+_Traceframe 0.2 on macOS with a real local repository loaded. Repository data is live; runtime and agent events remain representative until the M2 adapter lands._
+
+## Workspace tour
+
+| Area | What stays visible |
+| --- | --- |
+| Sessions | Parallel coding threads, their branch, unread state, and repository summary |
+| Agent conversation | User requests, orchestrator decisions, delegated work, model usage, and live activity |
+| Development workspace | Bounded repository explorer plus code, staged/unstaged diff, terminal, and trace tabs |
+| Context inspector | Token budget, source attribution, compaction policy, child agents, and memory |
+| Control bar | Active workspace, local Git branch, primary model, run state, and provider settings |
+
 ## Current state
 
 The first development milestone includes:
@@ -10,10 +24,14 @@ The first development milestone includes:
 - a dense workspace for sessions, conversation, code, diffs, terminal output, and execution traces
 - model provider and endpoint configuration without persisting API keys
 - context budget, compaction policy, memory, and agent topology views
-- native Git status, branch, and diff commands behind a narrow Rust bridge
+- a native workspace picker with recent-workspace recovery
+- live repository files, text previews, Git status, branches, and staged/unstaged diffs
+- guarded local branch switching with Git refusal surfaced in the workspace
 - a runtime-neutral event contract for Pi and other agent backends
 
-The interface currently runs against representative local data while the runtime adapter is connected.
+The selected repository workspace is live. Conversation, agent execution, context, and memory panels still use representative events until the first runtime adapter is connected.
+
+Workspace access stays behind the Rust host. File previews are confined to the selected canonical directory, binary files are rejected, large previews are truncated, and generated dependency/build directories are excluded from the explorer.
 
 ## Development
 

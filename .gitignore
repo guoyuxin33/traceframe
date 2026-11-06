@@ -2,6 +2,7 @@ node_modules/
 dist/
 src-tauri/target/
 outputs/
+work/
 .cargo/config.toml
 .DS_Store
 *.log

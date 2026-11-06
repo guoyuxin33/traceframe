@@ -18,6 +18,25 @@ export interface GitSnapshot {
   }>
 }
 
+export interface WorkspaceTreeEntry {
+  path: string
+  name: string
+  kind: 'file' | 'directory'
+  depth: number
+}
+
+export interface WorkspaceTree {
+  entries: WorkspaceTreeEntry[]
+  truncated: boolean
+}
+
+export interface WorkspaceFile {
+  path: string
+  content: string
+  size: number
+  truncated: boolean
+}
+
 export interface CcSwitchProvider {
   id: string
   name: string
@@ -43,6 +62,14 @@ export async function getNativeCapabilities() {
   return invoke<NativeCapabilities>('native_capabilities')
 }
 
+export async function pickWorkspace() {
+  return invoke<string | null>('pick_workspace')
+}
+
+export async function getRecentWorkspace() {
+  return invoke<string | null>('recent_workspace')
+}
+
 export async function getGitSnapshot(path: string) {
   return invoke<GitSnapshot>('git_snapshot', { path })
 }
@@ -51,8 +78,20 @@ export async function listGitBranches(path: string) {
   return invoke<string[]>('git_branches', { path })
 }
 
-export async function getGitDiff(path: string, staged = false) {
-  return invoke<string>('git_diff', { path, staged })
+export async function switchGitBranch(path: string, branch: string) {
+  return invoke<GitSnapshot>('git_switch_branch', { path, branch })
+}
+
+export async function getGitDiff(path: string, staged = false, relativePath?: string) {
+  return invoke<string>('git_diff', { path, staged, relativePath })
+}
+
+export async function getWorkspaceTree(path: string) {
+  return invoke<WorkspaceTree>('workspace_tree', { path })
+}
+
+export async function readWorkspaceFile(path: string, relativePath: string) {
+  return invoke<WorkspaceFile>('read_workspace_file', { path, relativePath })
 }
 
 export async function getCcSwitchStatus() {

@@ -1,10 +1,10 @@
 {
   "name": "traceframe-desktop",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --host 127.0.0.1",
+    "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "desktop:dev": "tauri dev",
