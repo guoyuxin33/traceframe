@@ -2,6 +2,20 @@
 
 Traceframe is a desktop workspace for transparent, multi-agent software development. It keeps conversation, tool execution, file changes, Git branches, context compaction, and memory on the same trace.
 
+![Traceframe 0.2 workspace showing live repository files, agent conversation, and context controls](docs/assets/traceframe-workspace.png)
+
+_Traceframe 0.2 on macOS with a real local repository loaded. Repository data is live; runtime and agent events remain representative until the M2 adapter lands._
+
+## Workspace tour
+
+| Area | What stays visible |
+| --- | --- |
+| Sessions | Parallel coding threads, their branch, unread state, and repository summary |
+| Agent conversation | User requests, orchestrator decisions, delegated work, model usage, and live activity |
+| Development workspace | Bounded repository explorer plus code, staged/unstaged diff, terminal, and trace tabs |
+| Context inspector | Token budget, source attribution, compaction policy, child agents, and memory |
+| Control bar | Active workspace, local Git branch, primary model, run state, and provider settings |
+
 ## Current state
 
 The first development milestone includes:
