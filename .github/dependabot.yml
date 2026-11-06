@@ -5,15 +5,27 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # jsdom 30 requires Node 22.22.2+, beyond the documented Node 22 baseline.
+      - dependency-name: jsdom
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: cargo
     directory: /src-tauri
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
     ignore:
-      # time 0.3.46+ requires Cargo's Edition 2024 support and breaks the Rust 1.84 MSRV.
+      # Keep automated updates inside the Rust/Cargo 1.84 compatibility boundary.
       - dependency-name: time
         versions: [">=0.3.46"]
+      - dependency-name: tokio
+        versions: [">=1.54.0"]
+      - dependency-name: tokio-util
+        versions: [">=0.7.20"]
+      - dependency-name: quinn-proto
+        versions: [">=0.11.15"]
+      - dependency-name: serde_with
+        versions: [">=3.18.0"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
