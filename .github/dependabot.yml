@@ -9,6 +9,9 @@ updates:
       # jsdom 30 requires Node 22.22.2+, beyond the documented Node 22 baseline.
       - dependency-name: jsdom
         update-types: ["version-update:semver-major"]
+      # Tauri's build validates that the JavaScript API matches the Rust minor release.
+      - dependency-name: "@tauri-apps/api"
+        versions: [">=2.12.0"]
   - package-ecosystem: cargo
     directory: /src-tauri
     schedule:
