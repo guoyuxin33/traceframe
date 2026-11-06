@@ -1,0 +1,13 @@
+node_modules/
+dist/
+src-tauri/target/
+outputs/
+.cargo/config.toml
+.DS_Store
+*.log
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+.env
+.env.*
+!.env.example
