@@ -10,6 +10,10 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # time 0.3.46+ requires Cargo's Edition 2024 support and breaks the Rust 1.84 MSRV.
+      - dependency-name: time
+        versions: [">=0.3.46"]
   - package-ecosystem: github-actions
     directory: /
     schedule:

@@ -1,14 +1,24 @@
-use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use std::collections::HashSet;
-use std::env;
 use std::fs;
-use std::io::Read;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
+
+mod runtime;
+mod store;
+
+use runtime::{provider_healthcheck, runtime_cancel, runtime_start, RuntimeControl};
+use store::{
+    app_snapshot, append_message, archive_session, compact_session, create_session, delete_memory,
+    save_memory, update_memory, update_session_scope, AppStore,
+};
 
 const MAX_TREE_ENTRIES: usize = 800;
 const MAX_TREE_DEPTH: usize = 6;
@@ -18,6 +28,8 @@ const MAX_GIT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_GIT_ERROR_BYTES: usize = 64 * 1024;
 const MAX_DIFF_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DIFF_OUTPUT_LINES: usize = 4_000;
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 struct WorkspaceAccessInner {
@@ -27,8 +39,9 @@ struct WorkspaceAccessInner {
 }
 
 #[derive(Default)]
-struct WorkspaceAccess {
+pub(crate) struct WorkspaceAccess {
     inner: Mutex<WorkspaceAccessInner>,
+    writes: Mutex<()>,
 }
 
 #[derive(Serialize)]
@@ -73,34 +86,13 @@ struct WorkspaceTree {
     truncated: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspaceFile {
     path: String,
     content: String,
     size: u64,
     truncated: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CcSwitchProvider {
-    id: String,
-    name: String,
-    app_type: String,
-    is_current: bool,
-    in_failover_queue: bool,
-    endpoint: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CcSwitchStatus {
-    installed: bool,
-    database_found: bool,
-    proxy_enabled: bool,
-    proxy_port: u16,
-    providers: Vec<CcSwitchProvider>,
 }
 
 fn canonical_workspace(path: &str) -> Result<PathBuf, String> {
@@ -134,17 +126,18 @@ impl WorkspaceAccess {
     }
 
     fn register(&self, workspace: PathBuf) -> Result<(), String> {
-        let (store_path, serialized) = {
-            let mut inner = self
-                .inner
-                .lock()
-                .map_err(|_| "Workspace access state is unavailable".to_string())?;
-            inner.roots.insert(workspace.clone());
-            inner.recent = Some(workspace.clone());
-            let serialized = serde_json::to_string(&workspace.to_string_lossy().to_string())
-                .map_err(|error| format!("Recent workspace could not be encoded: {error}"))?;
-            (inner.store_path.clone(), serialized)
-        };
+        let serialized = serde_json::to_string(&workspace.to_string_lossy().to_string())
+            .map_err(|error| format!("Recent workspace could not be encoded: {error}"))?;
+        let _write_guard = self
+            .writes
+            .lock()
+            .map_err(|_| "Workspace write state is unavailable".to_string())?;
+        let store_path = self
+            .inner
+            .lock()
+            .map_err(|_| "Workspace access state is unavailable".to_string())?
+            .store_path
+            .clone();
 
         if let Some(store_path) = store_path {
             if let Some(parent) = store_path.parent() {
@@ -155,6 +148,13 @@ impl WorkspaceAccess {
             fs::write(store_path, serialized)
                 .map_err(|error| format!("Recent workspace could not be saved: {error}"))?;
         }
+
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "Workspace access state is unavailable".to_string())?;
+        inner.roots.insert(workspace.clone());
+        inner.recent = Some(workspace);
         Ok(())
     }
 
@@ -169,7 +169,7 @@ impl WorkspaceAccess {
             .map(|path| path.to_string_lossy().to_string()))
     }
 
-    fn resolve(&self, path: &str) -> Result<PathBuf, String> {
+    pub(crate) fn resolve(&self, path: &str) -> Result<PathBuf, String> {
         let workspace = canonical_workspace(path)?;
         let inner = self
             .inner
@@ -376,6 +376,16 @@ fn run_git_limited(
     max_bytes: usize,
     label: &str,
 ) -> Result<String, String> {
+    run_git_limited_with_timeout(path, args, max_bytes, label, GIT_COMMAND_TIMEOUT)
+}
+
+fn run_git_limited_with_timeout(
+    path: &Path,
+    args: &[&str],
+    max_bytes: usize,
+    label: &str,
+    timeout: Duration,
+) -> Result<String, String> {
     let mut child = Command::new("git")
         .arg("-C")
         .arg(path)
@@ -407,9 +417,25 @@ fn run_git_limited(
             .read_to_end(&mut bytes)
             .map(|_| bytes)
     });
-    let status = child
-        .wait()
-        .map_err(|error| format!("Git command could not be completed: {error}"))?;
+    let started = Instant::now();
+    let (status, timed_out) = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("Git command could not be completed: {error}"))?
+        {
+            break (status, false);
+        }
+        if started.elapsed() >= timeout {
+            child
+                .kill()
+                .map_err(|error| format!("Timed out Git command could not be stopped: {error}"))?;
+            let status = child
+                .wait()
+                .map_err(|error| format!("Timed out Git command could not be reaped: {error}"))?;
+            break (status, true);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
     let bytes = stdout_reader
         .join()
         .map_err(|_| "Git output reader stopped unexpectedly".to_string())?
@@ -426,6 +452,12 @@ fn run_git_limited(
     }
     if error_bytes.len() > MAX_GIT_ERROR_BYTES {
         return Err("Git error output exceeds the preview limit".into());
+    }
+    if timed_out {
+        return Err(format!(
+            "Git command timed out after {} seconds",
+            timeout.as_secs_f32()
+        ));
     }
     if !status.success() {
         return Err(String::from_utf8_lossy(&error_bytes).trim().to_owned());
@@ -445,15 +477,22 @@ fn native_capabilities() -> NativeCapabilities {
 }
 
 #[tauri::command]
-fn pick_workspace(
+async fn pick_workspace(
     app: tauri::AppHandle,
+    window: tauri::Window,
     access: State<'_, WorkspaceAccess>,
 ) -> Result<Option<String>, String> {
-    let selected = app
-        .dialog()
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.dialog()
         .file()
         .set_title("Open a Traceframe workspace")
-        .blocking_pick_folder();
+        .set_parent(&window)
+        .pick_folder(move |selected| {
+            let _ = sender.send(selected);
+        });
+    let selected = receiver
+        .await
+        .map_err(|_| "Workspace picker closed without returning a result".to_string())?;
 
     let workspace = selected
         .map(|path| {
@@ -465,7 +504,10 @@ fn pick_workspace(
         })
         .transpose()?;
     if let Some(workspace) = workspace.as_ref() {
-        access.register(PathBuf::from(workspace))?;
+        let workspace_path = PathBuf::from(workspace);
+        git_snapshot_at(&workspace_path)
+            .map_err(|error| format!("Selected folder is not a Git repository: {error}"))?;
+        access.register(workspace_path)?;
     }
     Ok(workspace)
 }
@@ -600,7 +642,7 @@ fn read_workspace_file_at(
         .take((MAX_FILE_PREVIEW_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("Workspace file could not be read: {error}"))?;
-    if bytes.iter().take(8192).any(|byte| *byte == 0) {
+    if bytes.contains(&0) {
         return Err("Binary files cannot be previewed".into());
     }
     let mut truncated =
@@ -608,7 +650,17 @@ fn read_workspace_file_at(
     if truncated {
         bytes.truncate(MAX_FILE_PREVIEW_BYTES);
     }
-    let decoded = String::from_utf8_lossy(&bytes);
+    let decoded = match String::from_utf8(bytes) {
+        Ok(decoded) => decoded,
+        Err(error) if truncated && error.utf8_error().error_len().is_none() => {
+            let valid_up_to = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid_up_to);
+            String::from_utf8(bytes)
+                .map_err(|_| "Binary or non-UTF-8 files cannot be previewed".to_string())?
+        }
+        Err(_) => return Err("Binary or non-UTF-8 files cannot be previewed".into()),
+    };
     let mut lines = decoded.split_inclusive('\n');
     let content = lines
         .by_ref()
@@ -634,83 +686,296 @@ fn read_workspace_file(
     read_workspace_file_at(&workspace, relative_path)
 }
 
-#[tauri::command]
-fn cc_switch_status() -> Result<CcSwitchStatus, String> {
-    let installed = Path::new("/Applications/CC Switch.app").exists();
-    let database = env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".cc-switch/cc-switch.db"));
+struct EditableWorkspaceFile {
+    path: PathBuf,
+    content: String,
+    permissions: fs::Permissions,
+}
 
-    let Some(database) = database.filter(|path| path.exists()) else {
-        return Ok(CcSwitchStatus {
-            installed,
-            database_found: false,
-            proxy_enabled: false,
-            proxy_port: 15721,
-            providers: Vec::new(),
-        });
-    };
+fn editable_workspace_file(
+    workspace: &Path,
+    relative: &Path,
+) -> Result<EditableWorkspaceFile, String> {
+    let canonical_workspace = workspace
+        .canonicalize()
+        .map_err(|error| format!("Workspace is unavailable: {error}"))?;
+    let mut candidate = canonical_workspace.clone();
+    for component in relative.components() {
+        match component {
+            Component::Normal(segment) => candidate.push(segment),
+            Component::CurDir => continue,
+            _ => return Err("Workspace file path is invalid".into()),
+        }
+        let metadata = fs::symlink_metadata(&candidate)
+            .map_err(|error| format!("Workspace file is unavailable: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err("Symbolic links cannot be edited".into());
+        }
+    }
 
-    let connection = Connection::open_with_flags(
-        database,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| format!("CC Switch database is unavailable: {error}"))?;
+    let canonical_file = candidate
+        .canonicalize()
+        .map_err(|error| format!("Workspace file is unavailable: {error}"))?;
+    if !canonical_file.starts_with(&canonical_workspace) {
+        return Err("Workspace file is outside the selected directory".into());
+    }
+    let metadata = fs::symlink_metadata(&canonical_file)
+        .map_err(|error| format!("Workspace file metadata could not be read: {error}"))?;
+    if !metadata.file_type().is_file() {
+        return Err("Only existing regular files can be edited".into());
+    }
+    if metadata.len() > MAX_FILE_PREVIEW_BYTES as u64 {
+        return Err(format!(
+            "Files larger than {MAX_FILE_PREVIEW_BYTES} bytes cannot be edited"
+        ));
+    }
 
-    let (proxy_enabled, proxy_port) = connection
-        .query_row(
-            "SELECT MAX(CASE WHEN enabled = 1 THEN 1 ELSE 0 END), COALESCE(MAX(listen_port), 15721) FROM proxy_config",
-            [],
-            |row| Ok((row.get::<_, i64>(0)? == 1, row.get::<_, u16>(1)?)),
-        )
-        .unwrap_or((false, 15721));
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    fs::File::open(&canonical_file)
+        .map_err(|error| format!("Workspace file could not be opened: {error}"))?
+        .take((MAX_FILE_PREVIEW_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Workspace file could not be read: {error}"))?;
+    if bytes.len() > MAX_FILE_PREVIEW_BYTES {
+        return Err(format!(
+            "Files larger than {MAX_FILE_PREVIEW_BYTES} bytes cannot be edited"
+        ));
+    }
+    if bytes.contains(&0) {
+        return Err("Binary files cannot be edited".into());
+    }
+    let content = String::from_utf8(bytes)
+        .map_err(|_| "Binary or non-UTF-8 files cannot be edited".to_string())?;
+    if content
+        .split_inclusive('\n')
+        .take(MAX_FILE_PREVIEW_LINES + 1)
+        .count()
+        > MAX_FILE_PREVIEW_LINES
+    {
+        return Err("Truncated file previews cannot be edited".into());
+    }
 
-    let mut statement = connection
-        .prepare(
-            "SELECT p.id, p.name, p.app_type, p.is_current, p.in_failover_queue, MIN(e.url)
-             FROM providers p
-             LEFT JOIN provider_endpoints e ON e.provider_id = p.id AND e.app_type = p.app_type
-             GROUP BY p.id, p.name, p.app_type, p.is_current, p.in_failover_queue
-             ORDER BY p.is_current DESC, p.sort_index ASC, p.name ASC",
-        )
-        .map_err(|error| format!("CC Switch provider index is unavailable: {error}"))?;
-
-    let providers = statement
-        .query_map([], |row| {
-            Ok(CcSwitchProvider {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                app_type: row.get(2)?,
-                is_current: row.get::<_, i64>(3)? == 1,
-                in_failover_queue: row.get::<_, i64>(4)? == 1,
-                endpoint: row.get(5)?,
-            })
-        })
-        .map_err(|error| format!("CC Switch providers could not be read: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("CC Switch providers could not be decoded: {error}"))?;
-
-    Ok(CcSwitchStatus {
-        installed,
-        database_found: true,
-        proxy_enabled,
-        proxy_port,
-        providers,
+    Ok(EditableWorkspaceFile {
+        path: canonical_file,
+        content,
+        permissions: metadata.permissions(),
     })
+}
+
+fn sibling_temp_file(target: &Path) -> Result<(PathBuf, fs::File), String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| "Workspace file has no parent directory".to_string())?;
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Workspace file name is not valid UTF-8".to_string())?;
+    for _ in 0..64 {
+        let nonce = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".{name}.traceframe-{}-{nonce}.tmp",
+            std::process::id()
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "Temporary workspace file could not be created: {error}"
+                ))
+            }
+        }
+    }
+    Err("A unique temporary workspace file could not be created".into())
+}
+
+fn write_workspace_file_at(
+    workspace: &Path,
+    relative_path: String,
+    expected_original_content: String,
+    new_content: String,
+) -> Result<WorkspaceFile, String> {
+    let relative = safe_relative_path(&relative_path)?;
+    if new_content.len() > MAX_FILE_PREVIEW_BYTES {
+        return Err(format!(
+            "New content exceeds the {MAX_FILE_PREVIEW_BYTES} byte edit limit"
+        ));
+    }
+    if new_content.as_bytes().contains(&0) {
+        return Err("Binary content cannot be written".into());
+    }
+    if new_content
+        .split_inclusive('\n')
+        .take(MAX_FILE_PREVIEW_LINES + 1)
+        .count()
+        > MAX_FILE_PREVIEW_LINES
+    {
+        return Err(format!(
+            "New content exceeds the {MAX_FILE_PREVIEW_LINES} line edit limit"
+        ));
+    }
+
+    let original = editable_workspace_file(workspace, &relative)?;
+    if original.content != expected_original_content {
+        return Err("Workspace file changed on disk; reload it before saving".into());
+    }
+
+    let (temp_path, mut temp_file) = sibling_temp_file(&original.path)?;
+    let write_result = (|| -> Result<(), String> {
+        temp_file
+            .write_all(new_content.as_bytes())
+            .map_err(|error| format!("Workspace file could not be written: {error}"))?;
+        temp_file
+            .sync_all()
+            .map_err(|error| format!("Workspace file could not be synchronized: {error}"))?;
+        drop(temp_file);
+
+        let current = editable_workspace_file(workspace, &relative)?;
+        if current.path != original.path || current.content != expected_original_content {
+            return Err("Workspace file changed on disk; reload it before saving".into());
+        }
+        fs::set_permissions(&temp_path, current.permissions).map_err(|error| {
+            format!("Workspace file permissions could not be preserved: {error}")
+        })?;
+        fs::rename(&temp_path, &current.path)
+            .map_err(|error| format!("Workspace file could not be replaced: {error}"))?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    read_workspace_file_at(workspace, relative_path)
+}
+
+fn create_workspace_file_at(
+    workspace: &Path,
+    relative_path: String,
+    content: String,
+) -> Result<WorkspaceFile, String> {
+    let relative = safe_relative_path(&relative_path)?;
+    if content.len() > MAX_FILE_PREVIEW_BYTES {
+        return Err(format!(
+            "New content exceeds the {MAX_FILE_PREVIEW_BYTES} byte edit limit"
+        ));
+    }
+    if content.as_bytes().contains(&0) {
+        return Err("Binary content cannot be written".into());
+    }
+    if content
+        .split_inclusive('\n')
+        .take(MAX_FILE_PREVIEW_LINES + 1)
+        .count()
+        > MAX_FILE_PREVIEW_LINES
+    {
+        return Err(format!(
+            "New content exceeds the {MAX_FILE_PREVIEW_LINES} line edit limit"
+        ));
+    }
+
+    let canonical_workspace = workspace
+        .canonicalize()
+        .map_err(|error| format!("Workspace is unavailable: {error}"))?;
+    let file_name = relative
+        .file_name()
+        .ok_or_else(|| "Workspace file path is invalid".to_string())?;
+    let parent_relative = relative.parent().unwrap_or_else(|| Path::new(""));
+    let mut parent = canonical_workspace.clone();
+    for component in parent_relative.components() {
+        let Component::Normal(segment) = component else {
+            continue;
+        };
+        parent.push(segment);
+        match fs::symlink_metadata(&parent) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("Symbolic links cannot be used when creating files".into())
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err("A parent path is not a directory".into())
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&parent).map_err(|error| {
+                    format!("Workspace directory could not be created: {error}")
+                })?;
+            }
+            Err(error) => return Err(format!("Workspace directory is unavailable: {error}")),
+        }
+    }
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|error| format!("Workspace directory is unavailable: {error}"))?;
+    if !canonical_parent.starts_with(&canonical_workspace) {
+        return Err("Workspace file is outside the selected directory".into());
+    }
+
+    let target = canonical_parent.join(file_name);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "Workspace file already exists; read and edit it instead".to_string()
+            } else {
+                format!("Workspace file could not be created: {error}")
+            }
+        })?;
+    let write_result = file
+        .write_all(content.as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("Workspace file could not be written: {error}"));
+    if let Err(error) = write_result {
+        drop(file);
+        let _ = fs::remove_file(&target);
+        return Err(error);
+    }
+    drop(file);
+    read_workspace_file_at(workspace, relative_path)
+}
+
+#[tauri::command]
+fn write_workspace_file(
+    path: String,
+    relative_path: String,
+    expected_original_content: String,
+    new_content: String,
+    access: State<'_, WorkspaceAccess>,
+) -> Result<WorkspaceFile, String> {
+    let _write_guard = access
+        .writes
+        .lock()
+        .map_err(|_| "Workspace write state is unavailable".to_string())?;
+    let workspace = access.resolve(&path)?;
+    write_workspace_file_at(
+        &workspace,
+        relative_path,
+        expected_original_content,
+        new_content,
+    )
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(WorkspaceAccess::default())
+        .manage(AppStore::default())
+        .manage(RuntimeControl::default())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let store_path = app
+            let config_dir = app
                 .path()
                 .app_config_dir()
-                .map_err(|error| format!("Application config directory is unavailable: {error}"))?
-                .join("recent-workspace.json");
-            app.state::<WorkspaceAccess>().load_recent(store_path)?;
+                .map_err(|error| format!("Application config directory is unavailable: {error}"))?;
+            let data_dir = app
+                .path()
+                .app_data_dir()
+                .map_err(|error| format!("Application data directory is unavailable: {error}"))?;
+            app.state::<WorkspaceAccess>()
+                .load_recent(config_dir.join("recent-workspace.json"))?;
+            app.state::<AppStore>()
+                .initialize(data_dir.join("traceframe.sqlite3"))?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -723,7 +988,19 @@ pub fn run() {
             git_diff,
             workspace_tree,
             read_workspace_file,
-            cc_switch_status
+            write_workspace_file,
+            app_snapshot,
+            create_session,
+            update_session_scope,
+            archive_session,
+            append_message,
+            save_memory,
+            update_memory,
+            delete_memory,
+            compact_session,
+            provider_healthcheck,
+            runtime_start,
+            runtime_cancel
         ])
         .run(tauri::generate_context!())
         .expect("error while running Traceframe");
@@ -732,14 +1009,15 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        git_diff_at, git_snapshot_at, git_switch_branch_at, parse_git_snapshot,
-        read_workspace_file_at, safe_relative_path, workspace_tree_at, WorkspaceAccess,
+        create_workspace_file_at, git_diff_at, git_snapshot_at, git_switch_branch_at,
+        parse_git_snapshot, read_workspace_file_at, run_git_limited_with_timeout,
+        safe_relative_path, workspace_tree_at, write_workspace_file_at, WorkspaceAccess,
         MAX_DIFF_OUTPUT_LINES, MAX_FILE_PREVIEW_BYTES, MAX_FILE_PREVIEW_LINES, MAX_TREE_ENTRIES,
     };
     use std::fs;
     use std::path::Path;
     use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn run_test_git(path: &Path, args: &[&str]) {
         let status = Command::new("git")
@@ -777,6 +1055,349 @@ mod tests {
         assert!(safe_relative_path("../secrets.txt").is_err());
         assert!(safe_relative_path("/tmp/secrets.txt").is_err());
         assert!(safe_relative_path("").is_err());
+    }
+
+    #[test]
+    fn rejects_non_utf8_workspace_previews_at_any_file_size() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "traceframe-encoding-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&workspace).expect("workspace should be created");
+        fs::write(workspace.join("small.txt"), [b'a', 0x80])
+            .expect("small fixture should be written");
+        let mut large = vec![b'a'; MAX_FILE_PREVIEW_BYTES + 1];
+        large[32] = 0x80;
+        fs::write(workspace.join("large.txt"), large).expect("large fixture should be written");
+        let canonical = workspace
+            .canonicalize()
+            .expect("workspace should canonicalize");
+
+        for path in ["small.txt", "large.txt"] {
+            let error = read_workspace_file_at(&canonical, path.into())
+                .expect_err("non-UTF-8 preview should be rejected");
+            assert!(error.contains("non-UTF-8"));
+        }
+
+        fs::remove_dir_all(workspace).expect("temporary workspace should be removed");
+    }
+
+    #[test]
+    fn writes_existing_text_files_without_overwriting_stale_content() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "traceframe-write-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(workspace.join("src")).expect("workspace should be created");
+        let target = workspace.join("src/main.ts");
+        fs::write(&target, "export const value = 1\n").expect("fixture should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o640))
+                .expect("fixture permissions should be set");
+        }
+        let canonical = workspace
+            .canonicalize()
+            .expect("workspace should canonicalize");
+
+        let saved = write_workspace_file_at(
+            &canonical,
+            "src/main.ts".into(),
+            "export const value = 1\n".into(),
+            "export const value = 2\n".into(),
+        )
+        .expect("text file should be saved");
+        assert_eq!(saved.content, "export const value = 2\n");
+        assert!(!saved.truncated);
+        assert_eq!(
+            fs::read_to_string(&target).expect("saved file should be readable"),
+            "export const value = 2\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&target)
+                    .expect("saved metadata should be readable")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640
+            );
+        }
+
+        fs::write(&target, "changed elsewhere\n").expect("fixture should change on disk");
+        let error = write_workspace_file_at(
+            &canonical,
+            "src/main.ts".into(),
+            "export const value = 2\n".into(),
+            "would overwrite\n".into(),
+        )
+        .expect_err("stale content should be rejected");
+        assert!(error.contains("changed on disk"));
+        assert_eq!(
+            fs::read_to_string(&target).expect("changed file should remain readable"),
+            "changed elsewhere\n"
+        );
+
+        fs::remove_dir_all(workspace).expect("temporary workspace should be removed");
+    }
+
+    #[test]
+    fn creates_new_text_files_without_overwriting_existing_paths() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "traceframe-create-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&workspace).expect("workspace should be created");
+        let canonical = workspace
+            .canonicalize()
+            .expect("workspace should canonicalize");
+
+        let saved = create_workspace_file_at(
+            &canonical,
+            "src/generated.ts".into(),
+            "export const generated = true\n".into(),
+        )
+        .expect("new file should be created");
+        assert_eq!(saved.path, "src/generated.ts");
+        assert_eq!(saved.content, "export const generated = true\n");
+        assert!(create_workspace_file_at(
+            &canonical,
+            "src/generated.ts".into(),
+            "overwrite\n".into()
+        )
+        .expect_err("existing file should not be overwritten")
+        .contains("already exists"));
+        assert!(
+            create_workspace_file_at(&canonical, "../outside.txt".into(), "outside\n".into())
+                .is_err()
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            fs::create_dir_all(workspace.join("real-dir"))
+                .expect("real directory should be created");
+            symlink(workspace.join("real-dir"), workspace.join("linked-dir"))
+                .expect("directory symlink fixture should be created");
+            assert!(create_workspace_file_at(
+                &canonical,
+                "linked-dir/escaped.txt".into(),
+                "blocked\n".into(),
+            )
+            .expect_err("symlink parent should be rejected")
+            .contains("Symbolic links"));
+        }
+
+        fs::remove_dir_all(workspace).expect("temporary workspace should be removed");
+    }
+
+    #[test]
+    fn rejects_unsafe_or_truncated_workspace_writes() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "traceframe-write-reject-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&workspace).expect("workspace should be created");
+        fs::write(workspace.join("small.txt"), "small\n").expect("fixture should be written");
+        fs::write(workspace.join("binary.bin"), [0, 1, 2])
+            .expect("binary fixture should be written");
+        fs::write(workspace.join("invalid-utf8.txt"), [0xff, 0xfe])
+            .expect("invalid UTF-8 fixture should be written");
+        fs::write(
+            workspace.join("large.txt"),
+            vec![b'x'; MAX_FILE_PREVIEW_BYTES + 1],
+        )
+        .expect("large fixture should be written");
+        fs::write(
+            workspace.join("many-lines.txt"),
+            "line\n".repeat(MAX_FILE_PREVIEW_LINES + 1),
+        )
+        .expect("line-limited fixture should be written");
+        let canonical = workspace
+            .canonicalize()
+            .expect("workspace should canonicalize");
+
+        assert!(write_workspace_file_at(
+            &canonical,
+            "missing.txt".into(),
+            String::new(),
+            "new\n".into()
+        )
+        .is_err());
+        assert!(write_workspace_file_at(
+            &canonical,
+            "../outside.txt".into(),
+            String::new(),
+            "new\n".into()
+        )
+        .is_err());
+        assert!(write_workspace_file_at(
+            &canonical,
+            "binary.bin".into(),
+            String::new(),
+            "new\n".into()
+        )
+        .is_err());
+        assert!(write_workspace_file_at(
+            &canonical,
+            "invalid-utf8.txt".into(),
+            String::new(),
+            "new\n".into()
+        )
+        .is_err());
+        assert!(write_workspace_file_at(
+            &canonical,
+            "large.txt".into(),
+            String::new(),
+            "new\n".into()
+        )
+        .is_err());
+        assert!(write_workspace_file_at(
+            &canonical,
+            "many-lines.txt".into(),
+            String::new(),
+            "new\n".into()
+        )
+        .is_err());
+        assert!(write_workspace_file_at(
+            &canonical,
+            "small.txt".into(),
+            "small\n".into(),
+            "x".repeat(MAX_FILE_PREVIEW_BYTES + 1)
+        )
+        .is_err());
+        assert_eq!(
+            fs::read_to_string(workspace.join("small.txt"))
+                .expect("small fixture should remain readable"),
+            "small\n"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(workspace.join("small.txt"), workspace.join("linked.txt"))
+                .expect("symlink fixture should be created");
+            let error = write_workspace_file_at(
+                &canonical,
+                "linked.txt".into(),
+                "small\n".into(),
+                "linked write\n".into(),
+            )
+            .expect_err("symlink should be rejected");
+            assert!(error.contains("Symbolic links"));
+
+            fs::create_dir_all(workspace.join("real-dir"))
+                .expect("real directory should be created");
+            fs::write(workspace.join("real-dir/nested.txt"), "nested\n")
+                .expect("nested fixture should be written");
+            symlink(workspace.join("real-dir"), workspace.join("linked-dir"))
+                .expect("directory symlink fixture should be created");
+            assert!(write_workspace_file_at(
+                &canonical,
+                "linked-dir/nested.txt".into(),
+                "nested\n".into(),
+                "linked write\n".into(),
+            )
+            .is_err());
+        }
+
+        fs::remove_dir_all(workspace).expect("temporary workspace should be removed");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stops_git_commands_that_exceed_the_deadline() {
+        let error = run_git_limited_with_timeout(
+            Path::new("/tmp"),
+            &["-c", "alias.traceframe-hang=!sleep 3", "traceframe-hang"],
+            1024,
+            "Git output",
+            Duration::from_millis(100),
+        )
+        .expect_err("the command should time out");
+        assert!(error.contains("timed out"));
+    }
+
+    #[test]
+    fn persists_recent_workspace_only_after_the_config_write_succeeds() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "traceframe-recent-workspace-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace should be created");
+        let canonical = workspace
+            .canonicalize()
+            .expect("workspace should canonicalize");
+        let store_path = root.join("config/recent-workspace.json");
+
+        let access = WorkspaceAccess::default();
+        access
+            .load_recent(store_path.clone())
+            .expect("recent workspace state should initialize");
+        access
+            .register(canonical.clone())
+            .expect("recent workspace should persist");
+        assert_eq!(
+            access.recent().expect("recent workspace should load"),
+            Some(canonical.to_string_lossy().to_string())
+        );
+        let encoded = fs::read_to_string(&store_path).expect("recent workspace file should exist");
+        assert_eq!(
+            serde_json::from_str::<String>(&encoded)
+                .expect("recent workspace should be valid JSON"),
+            canonical.to_string_lossy()
+        );
+        drop(access);
+
+        let reopened = WorkspaceAccess::default();
+        reopened
+            .load_recent(store_path)
+            .expect("persisted recent workspace should reopen");
+        assert_eq!(
+            reopened
+                .resolve(&canonical.to_string_lossy())
+                .expect("reopened workspace should remain authorized"),
+            canonical
+        );
+        drop(reopened);
+
+        let blocked_parent = root.join("not-a-directory");
+        fs::write(&blocked_parent, "block directory creation")
+            .expect("blocking file should be written");
+        let failed = WorkspaceAccess::default();
+        failed
+            .load_recent(blocked_parent.join("recent-workspace.json"))
+            .expect("recent workspace state should initialize");
+        assert!(failed.register(canonical.clone()).is_err());
+        assert_eq!(failed.recent().unwrap(), None);
+        assert!(failed.resolve(&canonical.to_string_lossy()).is_err());
+        drop(failed);
+
+        fs::remove_dir_all(root).expect("temporary workspace should be removed");
     }
 
     #[test]

@@ -18,6 +18,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm test
       - run: npm run build
       - run: npm audit --audit-level=high
 
@@ -30,11 +31,14 @@ jobs:
           node-version: 22
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
       - run: npm ci
-      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
       - run: npm run desktop:build
 
   msrv:
@@ -48,4 +52,4 @@ jobs:
         with:
           workspaces: src-tauri
           key: msrv-1.84.0
-      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml

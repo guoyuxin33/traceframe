@@ -1,43 +1,59 @@
 # Roadmap
 
-Traceframe is being built in visible, testable slices. Each milestone must keep the desktop application runnable.
+Checked items exist in the current development tree. Visible controls are not marked complete until their native behavior works.
 
-## M1: Native workspace foundation
+## Implemented foundation
 
-- [x] Tauri desktop shell and macOS bundle
-- [x] conversation, code, diff, terminal, trace, context, memory, and agent views
-- [x] native Git status, branch, and diff bridge
-- [x] runtime-neutral event contract
-- [x] CC Switch discovery and proxy configuration import
-- [x] selectable theme, density, and workspace balance
-- [x] workspace picker backed by the native dialog
-- [x] replace representative Git data with the selected workspace snapshot
+- [x] native Tauri desktop shell and macOS bundle
+- [x] draggable, resizable, persistent multi-tab workspace layouts
+- [x] host-authorized workspace picker and recent-workspace recovery
+- [x] bounded repository tree, editable text preview, guarded save and revert
+- [x] Git status, staged and unstaged diffs, branch list, and guarded branch switching
+- [x] SQLite persistence for sessions, messages, summaries, scoped memories, and runtime events
+- [x] session create, search, archive, restore, and message history
+- [x] Traceframe-owned Responses tool loop with cancellation, 16 tool rounds, and a tools-disabled final synthesis
+- [x] bounded serial child-agent delegation with inherited run scope and non-recursive child tools
+- [x] visible parent/child agent lifecycle and tool events
+- [x] file list/read/edit/write/create, Git status/diff, and bounded command tools
+- [x] CC Switch local Responses route without renderer-supplied credentials
+- [x] direct OpenAI Responses, Anthropic, and OpenAI-compatible streaming providers
+- [x] provider health checks, live model discovery, and official OpenAI catalog reference
+- [x] in-memory API key flow that excludes keys from persistence and repository files
+- [x] deterministic manual session compaction and scoped memory injection
+- [x] real-time output, trace, tool timing, usage, file-change, failure, and cancellation views
+- [x] streamed mock Responses tests covering delegation and post-budget synthesis
 
-## M2: Runtime integration
+## Runtime hardening
 
-- [ ] Pi runtime adapter using SDK or RPC
-- [ ] provider catalog and model capability normalization
-- [ ] streamed runtime events from host to renderer
-- [ ] tool permission broker with allow, ask, and deny policies
-- [ ] cancellable runs and recovery after application restart
+- [ ] move direct-provider credentials into host-only or operating-system secret storage
+- [ ] add allow, ask, and deny policies before every mutating tool
+- [ ] isolate development commands beyond the current allowlist, timeout, and output limits
+- [ ] recover or reconcile interrupted runs after application restart
+- [ ] add renderer reconnect and event-channel backpressure behavior
+- [ ] persist opaque reasoning continuity across user turns where provider policy permits it
+- [ ] handle provider refusal output as a first-class terminal response
+- [ ] add provider refusal, malformed stream, reconnect, and backpressure integration coverage
 
-## M3: Multi-agent execution
+## Multi-agent execution
 
-- [ ] orchestrator-owned task graph
+- [x] Traceframe-owned root-to-specialist delegation loop with a four-child run budget
+- [x] provider/model/workspace/branch inheritance for delegated specialists
+- [x] causal parent/child IDs in live and persisted runtime events
+- [ ] persistent task graph and concurrent child-agent scheduler
 - [ ] isolated worktree per child agent
-- [ ] per-agent model, budget, context, and permission profile
+- [ ] per-agent provider, model, budget, context, and permission profile
 - [ ] conflict-aware review and merge queue
 - [ ] reusable agent templates
 
-## M4: Context and memory
+## Context and memory
 
-- [ ] token accounting from real provider events
-- [ ] configurable compaction checkpoints
-- [ ] short-term session summaries
-- [ ] project decisions and constraints store
-- [ ] semantic long-term memory retrieval with provenance
+- [ ] provider-authoritative context accounting and budget enforcement
+- [ ] automatic, policy-driven compaction checkpoints
+- [ ] model-generated short-term summaries with provenance
+- [ ] semantic long-term retrieval with provenance and deletion controls
+- [ ] explicit memory conflict and supersession handling
 
-## M5: Distribution
+## Distribution
 
 - [ ] signed and notarized macOS builds
 - [ ] Windows and Linux bundles
