@@ -7,19 +7,22 @@ use futures_util::StreamExt;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{ipc::Channel, State};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 
 const MAX_ERROR_BYTES: usize = 64 * 1024;
 const MAX_STREAM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_MODEL_TOOL_OUTPUT_CHARS: usize = 16_000;
 const MAX_TOOL_ROUNDS: usize = 16;
 const MAX_CHILD_TOOL_ROUNDS: usize = 8;
 const MAX_DELEGATED_AGENTS: usize = 4;
@@ -38,16 +41,43 @@ pub struct RuntimeControl {
     cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
+impl RuntimeControl {
+    fn register(&self, run_id: &str) -> Result<Arc<AtomicBool>, String> {
+        let mut runs = self
+            .cancellations
+            .lock()
+            .map_err(|_| "Runtime cancellation state is unavailable".to_string())?;
+        match runs.entry(run_id.to_owned()) {
+            Entry::Occupied(_) => Err("A run with this ID is already active".into()),
+            Entry::Vacant(entry) => {
+                let cancellation = Arc::new(AtomicBool::new(false));
+                entry.insert(cancellation.clone());
+                Ok(cancellation)
+            }
+        }
+    }
+
+    fn unregister(&self, run_id: &str, cancellation: &Arc<AtomicBool>) {
+        if let Ok(mut runs) = self.cancellations.lock() {
+            let owns_registration = runs
+                .get(run_id)
+                .is_some_and(|current| Arc::ptr_eq(current, cancellation));
+            if owns_registration {
+                runs.remove(run_id);
+            }
+        }
+    }
+}
+
 struct RunRegistration<'a> {
     control: &'a RuntimeControl,
     run_id: String,
+    cancellation: Arc<AtomicBool>,
 }
 
 impl Drop for RunRegistration<'_> {
     fn drop(&mut self) {
-        if let Ok(mut runs) = self.control.cancellations.lock() {
-            runs.remove(&self.run_id);
-        }
+        self.control.unregister(&self.run_id, &self.cancellation);
     }
 }
 
@@ -549,6 +579,18 @@ fn truncate_chars(value: &str, limit: usize) -> String {
     truncated
 }
 
+fn model_tool_output(value: &str) -> String {
+    if value.chars().count() <= MAX_MODEL_TOOL_OUTPUT_CHARS {
+        return value.to_owned();
+    }
+    json!({
+        "truncated": true,
+        "notice": "Tool output was shortened for the active model context. Re-run a narrower read, diff, search, or command to inspect the omitted data.",
+        "output": truncate_chars(value, MAX_MODEL_TOOL_OUTPUT_CHARS),
+    })
+    .to_string()
+}
+
 fn without_current_prompt<'a>(messages: &'a [MessageRecord], prompt: &str) -> &'a [MessageRecord] {
     match messages.last() {
         Some(message) if message.role == "user" && message.body.trim() == prompt.trim() => {
@@ -597,6 +639,7 @@ fn agent_instructions(
 Repository: {}\n\
 Branch: {}\n\
 Use the supplied Traceframe tools for all repository claims and changes. Read before editing, make focused changes, run relevant checks, and report the exact files and verification performed. Never claim a file or command changed unless a tool result proves it. Do not access paths outside the authorized workspace.\n\n\
+You cannot create or update Traceframe's durable Memory records. Never claim that information was saved for future sessions; ask the user to save it explicitly in the Memory panel.\n\n\
 Durable session summary:\n{}\n\n\
 Scoped durable memories (the current explicit request wins if any memory conflicts):\n{}",
         request.workspace_path,
@@ -607,13 +650,31 @@ Scoped durable memories (the current explicit request wins if any memory conflic
 }
 
 fn specialist_instructions(request: &RuntimeRequest, agent: &AgentContext) -> String {
+    let capability = match agent.profile {
+        AgentProfile::Scout => {
+            "You are read-only. Explore the repository and return findings with exact file evidence."
+        }
+        AgentProfile::Reviewer => {
+            "You are read-only. Review existing work for defects, regressions, and missing verification."
+        }
+        AgentProfile::Worker => {
+            "You may use the host-provided write and command tools needed to complete the scoped task."
+        }
+        AgentProfile::Root => "Follow the host-provided tool policy.",
+    };
     format!(
-        "You are {} ({}) inside Traceframe, working as a bounded specialist for the root agent.\n\
+        "You are {} ({}, {} profile) inside Traceframe, working as a bounded specialist for the root agent.\n\
 Repository: {}\n\
 Branch: {}\n\
 Assigned task: {}\n\
-Complete only this task. Use the supplied Traceframe tools for every repository claim. Read before editing, keep changes focused, run relevant checks, and return a concise evidence-backed result for the root agent. You cannot delegate and must not access paths outside the authorized workspace.",
-        agent.name, agent.role, request.workspace_path, request.branch, agent.task
+{} Complete only this task. Use the supplied Traceframe tools for every repository claim, and return a concise evidence-backed result for the root agent. You cannot delegate, expand your host-owned profile, or access paths outside the authorized workspace.",
+        agent.name,
+        agent.role,
+        agent.profile.as_str(),
+        request.workspace_path,
+        request.branch,
+        agent.task,
+        capability
     )
 }
 
@@ -641,15 +702,43 @@ fn responses_input(messages: &[MessageRecord], prompt: &str) -> Vec<Value> {
     input
 }
 
+#[cfg(unix)]
+async fn signal_process_group(process_id: Option<u32>, signal: &str) {
+    let Some(process_id) = process_id else {
+        return;
+    };
+    let _ = Command::new("/bin/kill")
+        .arg(format!("-{signal}"))
+        .arg(format!("-{process_id}"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+}
+
 async fn terminate_child(child: &mut Child) -> Result<(), String> {
-    let kill_error = child.start_kill().err();
+    let process_id = child.id();
+    #[cfg(unix)]
+    signal_process_group(process_id, "TERM").await;
+    #[cfg(not(unix))]
+    let _ = child.start_kill();
+
     match tokio::time::timeout(CHILD_EXIT_TIMEOUT, child.wait()).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => Err(format!("Child process could not be reaped: {error}")),
-        Err(_) => Err(match kill_error {
-            Some(error) => format!("Child process could not be killed or reaped: {error}"),
-            None => "Child process did not exit after it was killed".into(),
-        }),
+        Err(_) => {
+            #[cfg(unix)]
+            signal_process_group(process_id, "KILL").await;
+            let kill_error = child.start_kill().err();
+            match tokio::time::timeout(CHILD_EXIT_TIMEOUT, child.wait()).await {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(error)) => Err(format!("Child process could not be reaped: {error}")),
+                Err(_) => Err(match kill_error {
+                    Some(error) => format!("Child process could not be killed or reaped: {error}"),
+                    None => "Child process did not exit after it was killed".into(),
+                }),
+            }
+        }
     }
 }
 
@@ -671,13 +760,20 @@ struct ResponsesRound {
 #[derive(Debug)]
 struct ToolExecution {
     output: String,
-    changed_file: Option<ChangedFile>,
+    changed_files: Vec<ChangedFile>,
     ok: bool,
 }
 
 #[derive(Debug)]
 struct ChangedFile {
     path: String,
+    start_line: usize,
+    end_line: usize,
+}
+
+#[derive(Debug)]
+struct CommandFileState {
+    fingerprint: u64,
     start_line: usize,
     end_line: usize,
 }
@@ -721,6 +817,55 @@ struct AgentContext {
     role: String,
     task: String,
     allow_delegate: bool,
+    profile: AgentProfile,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentProfile {
+    Root,
+    Scout,
+    Reviewer,
+    Worker,
+}
+
+impl AgentProfile {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "scout" => Ok(Self::Scout),
+            "reviewer" => Ok(Self::Reviewer),
+            "worker" => Ok(Self::Worker),
+            _ => Err("delegate_task profile must be scout, reviewer, or worker".into()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::Scout => "scout",
+            Self::Reviewer => "reviewer",
+            Self::Worker => "worker",
+        }
+    }
+
+    fn allows_tool(self, name: &str) -> bool {
+        match self {
+            Self::Root | Self::Worker => matches!(
+                name,
+                "list_files"
+                    | "read_file"
+                    | "edit_file"
+                    | "write_file"
+                    | "create_file"
+                    | "git_status"
+                    | "git_diff"
+                    | "run_command"
+                    | "delegate_task"
+            ),
+            Self::Scout | Self::Reviewer => {
+                matches!(name, "list_files" | "read_file" | "git_status" | "git_diff")
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -753,7 +898,7 @@ fn emit_agent(
     emit(channel, store, request, sequence, event_type, payload)
 }
 
-fn tool_definitions(allow_delegate: bool) -> Vec<Value> {
+fn tool_definitions(profile: AgentProfile, allow_delegate: bool) -> Vec<Value> {
     let mut tools = vec![
         json!({
             "type": "function",
@@ -872,19 +1017,25 @@ fn tool_definitions(allow_delegate: bool) -> Vec<Value> {
             "strict": true
         }),
     ];
-    if allow_delegate {
+    tools.retain(|tool| {
+        tool.get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| profile.allows_tool(name))
+    });
+    if allow_delegate && profile == AgentProfile::Root {
         tools.push(json!({
             "type": "function",
             "name": "delegate_task",
-            "description": "Delegate one bounded specialist task to an independent Traceframe subagent. The subagent inherits this provider, model, branch, and authorized workspace; it cannot delegate again. Use only when a focused second pass materially improves the result.",
+            "description": "Delegate one bounded specialist task to an independent Traceframe subagent. Choose scout or reviewer for read-only investigation and worker only when repository mutation or commands are required. The host enforces the profile; the child inherits this provider, model, branch, and authorized workspace and cannot delegate again.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "minLength": 1, "maxLength": 48 },
                     "role": { "type": "string", "minLength": 1, "maxLength": 48 },
+                    "profile": { "type": "string", "enum": ["scout", "reviewer", "worker"] },
                     "task": { "type": "string", "minLength": 1, "maxLength": 2000 }
                 },
-                "required": ["name", "role", "task"],
+                "required": ["name", "role", "profile", "task"],
                 "additionalProperties": false
             },
             "strict": true
@@ -938,6 +1089,127 @@ fn command_allowed(program: &str) -> bool {
     )
 }
 
+fn diff_changed_range(diff: &str) -> Option<(usize, usize)> {
+    let hunk = diff.lines().find(|line| line.starts_with("@@ "))?;
+    let next = hunk.split_whitespace().find(|part| part.starts_with('+'))?;
+    let (start, count) = next[1..].split_once(',').unwrap_or((&next[1..], "1"));
+    let start = start.parse::<usize>().ok()?.max(1);
+    let count = count.parse::<usize>().ok()?.max(1);
+    Some((start, start.saturating_add(count - 1)))
+}
+
+fn command_file_states(workspace: &Path) -> HashMap<String, CommandFileState> {
+    let Ok(snapshot) = git_snapshot_at(workspace) else {
+        return HashMap::new();
+    };
+    snapshot
+        .files
+        .into_iter()
+        .map(|file| {
+            let staged = git_diff_at(workspace, true, Some(file.path.clone()))
+                .unwrap_or_else(|error| format!("staged diff error: {error}"));
+            let working = git_diff_at(workspace, false, Some(file.path.clone()))
+                .unwrap_or_else(|error| format!("working diff error: {error}"));
+            let preview = if staged.trim().is_empty() && working.trim().is_empty() {
+                read_workspace_file_at(workspace, file.path.clone())
+                    .map(|file| file.content)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let metadata = (staged.trim().is_empty() && working.trim().is_empty())
+                .then(|| {
+                    safe_relative_path(&file.path)
+                        .ok()
+                        .and_then(|path| std::fs::metadata(workspace.join(path)).ok())
+                        .map(|metadata| {
+                            let modified = metadata
+                                .modified()
+                                .ok()
+                                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|duration| duration.as_nanos())
+                                .unwrap_or_default();
+                            (metadata.len(), modified)
+                        })
+                })
+                .flatten();
+            let range = diff_changed_range(&working)
+                .or_else(|| diff_changed_range(&staged))
+                .unwrap_or_else(|| {
+                    let lines = preview.lines().count().max(1);
+                    (1, lines)
+                });
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            file.index_status.hash(&mut hasher);
+            file.worktree_status.hash(&mut hasher);
+            staged.hash(&mut hasher);
+            working.hash(&mut hasher);
+            preview.hash(&mut hasher);
+            metadata.hash(&mut hasher);
+            (
+                file.path,
+                CommandFileState {
+                    fingerprint: hasher.finish(),
+                    start_line: range.0,
+                    end_line: range.1,
+                },
+            )
+        })
+        .collect()
+}
+
+fn changed_command_files(
+    before: &HashMap<String, CommandFileState>,
+    after: &HashMap<String, CommandFileState>,
+) -> Vec<ChangedFile> {
+    let mut changes = after
+        .iter()
+        .filter(|(path, state)| {
+            before
+                .get(*path)
+                .is_none_or(|previous| previous.fingerprint != state.fingerprint)
+        })
+        .map(|(path, state)| ChangedFile {
+            path: path.clone(),
+            start_line: state.start_line,
+            end_line: state.end_line,
+        })
+        .collect::<Vec<_>>();
+    changes.extend(
+        before
+            .iter()
+            .filter(|(path, _)| !after.contains_key(*path))
+            .map(|(path, state)| ChangedFile {
+                path: path.clone(),
+                start_line: state.start_line,
+                end_line: state.end_line,
+            }),
+    );
+    changes.sort_by(|left, right| left.path.cmp(&right.path));
+    changes
+}
+
+async fn read_bounded_output<R>(mut reader: R, limit: usize) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut retained = Vec::with_capacity(limit.min(8 * 1024));
+    let mut buffer = [0u8; 8 * 1024];
+    let mut truncated = false;
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(retained.len());
+        if remaining > 0 {
+            retained.extend_from_slice(&buffer[..count.min(remaining)]);
+        }
+        truncated |= count > remaining;
+    }
+    Ok((retained, truncated))
+}
+
 async fn run_bounded_command(
     workspace: &Path,
     program: &str,
@@ -958,13 +1230,18 @@ async fn run_bounded_command(
         return Err("Command arguments cannot contain NUL bytes".into());
     }
     let directory = tool_workdir(workspace, workdir)?;
-    let mut child = Command::new(program)
+    let files_before = command_file_states(workspace);
+    let mut command = Command::new(program);
+    command
         .args(args)
         .current_dir(directory)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .spawn()
         .map_err(|error| format!("Command could not start: {error}"))?;
     let stdout = child
@@ -975,40 +1252,31 @@ async fn run_bounded_command(
         .stderr
         .take()
         .ok_or_else(|| "Command error output is unavailable".to_string())?;
-    let stdout_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stdout
-            .take((MAX_COMMAND_OUTPUT_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .await
-            .map(|_| bytes)
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stderr
-            .take((MAX_ERROR_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .await
-            .map(|_| bytes)
-    });
+    let stdout_task =
+        tokio::spawn(async move { read_bounded_output(stdout, MAX_COMMAND_OUTPUT_BYTES).await });
+    let stderr_task =
+        tokio::spawn(async move { read_bounded_output(stderr, MAX_ERROR_BYTES).await });
     let started = Instant::now();
+    let mut stop_reason = None;
     let status = loop {
         if cancellation.load(Ordering::SeqCst) {
             terminate_child(&mut child).await?;
-            return Err("Run cancelled by user".into());
+            stop_reason = Some("Run cancelled by user".to_string());
+            break None;
         }
         if started.elapsed() >= timeout {
             terminate_child(&mut child).await?;
-            return Err(format!(
+            stop_reason = Some(format!(
                 "Command timed out after {} seconds",
                 timeout.as_secs()
             ));
+            break None;
         }
         if let Some(status) = child
             .try_wait()
             .map_err(|error| format!("Command status could not be read: {error}"))?
         {
-            break status;
+            break Some(status);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
@@ -1020,22 +1288,23 @@ async fn run_bounded_command(
         .await
         .map_err(|error| format!("Command error reader stopped: {error}"))?
         .map_err(|error| format!("Command error output could not be read: {error}"))?;
-    let stdout_truncated = stdout.len() > MAX_COMMAND_OUTPUT_BYTES;
-    let stderr_truncated = stderr.len() > MAX_ERROR_BYTES;
-    let stdout = &stdout[..stdout.len().min(MAX_COMMAND_OUTPUT_BYTES)];
-    let stderr = &stderr[..stderr.len().min(MAX_ERROR_BYTES)];
+    let (stdout, stdout_truncated) = stdout;
+    let (stderr, stderr_truncated) = stderr;
+    let files_after = command_file_states(workspace);
+    let success = status.as_ref().is_some_and(|status| status.success());
     Ok(ToolExecution {
         output: json!({
-            "exitCode": status.code(),
-            "success": status.success(),
-            "stdout": String::from_utf8_lossy(stdout),
-            "stderr": String::from_utf8_lossy(stderr),
+            "exitCode": status.as_ref().and_then(|status| status.code()),
+            "success": success,
+            "error": stop_reason,
+            "stdout": String::from_utf8_lossy(&stdout),
+            "stderr": String::from_utf8_lossy(&stderr),
             "stdoutTruncated": stdout_truncated,
             "stderrTruncated": stderr_truncated,
         })
         .to_string(),
-        changed_file: None,
-        ok: status.success(),
+        changed_files: changed_command_files(&files_before, &files_after),
+        ok: success,
     })
 }
 
@@ -1046,6 +1315,9 @@ async fn execute_tool(
     access: &WorkspaceAccess,
     cancellation: &AtomicBool,
 ) -> Result<ToolExecution, String> {
+    if cancellation.load(Ordering::SeqCst) {
+        return Err("Run cancelled by user".into());
+    }
     let arguments: Value = serde_json::from_str(raw_arguments)
         .map_err(|error| format!("Tool arguments are invalid JSON: {error}"))?;
     match name {
@@ -1069,7 +1341,7 @@ async fn execute_tool(
             }
             Ok(ToolExecution {
                 output: value.to_string(),
-                changed_file: None,
+                changed_files: Vec::new(),
                 ok: true,
             })
         }
@@ -1079,7 +1351,7 @@ async fn execute_tool(
             Ok(ToolExecution {
                 output: serde_json::to_string(&file)
                     .map_err(|error| format!("Workspace file could not be encoded: {error}"))?,
-                changed_file: None,
+                changed_files: Vec::new(),
                 ok: true,
             })
         }
@@ -1098,6 +1370,9 @@ async fn execute_tool(
                 .writes
                 .lock()
                 .map_err(|_| "Workspace write state is unavailable".to_string())?;
+            if cancellation.load(Ordering::SeqCst) {
+                return Err("Run cancelled by user".into());
+            }
             let current = read_workspace_file_at(workspace, path.clone())?;
             if current.truncated {
                 return Err("Truncated files cannot be edited".into());
@@ -1126,7 +1401,7 @@ async fn execute_tool(
             Ok(ToolExecution {
                 output: serde_json::to_string(&saved)
                     .map_err(|error| format!("Workspace file could not be encoded: {error}"))?,
-                changed_file: Some(changed_file),
+                changed_files: vec![changed_file],
                 ok: true,
             })
         }
@@ -1138,6 +1413,9 @@ async fn execute_tool(
                 .writes
                 .lock()
                 .map_err(|_| "Workspace write state is unavailable".to_string())?;
+            if cancellation.load(Ordering::SeqCst) {
+                return Err("Run cancelled by user".into());
+            }
             let (start_line, end_line) = changed_line_range(&expected, &new_content);
             let saved = write_workspace_file_at(workspace, path.clone(), expected, new_content)?;
             let changed_file = ChangedFile {
@@ -1148,7 +1426,7 @@ async fn execute_tool(
             Ok(ToolExecution {
                 output: serde_json::to_string(&saved)
                     .map_err(|error| format!("Workspace file could not be encoded: {error}"))?,
-                changed_file: Some(changed_file),
+                changed_files: vec![changed_file],
                 ok: true,
             })
         }
@@ -1159,6 +1437,9 @@ async fn execute_tool(
                 .writes
                 .lock()
                 .map_err(|_| "Workspace write state is unavailable".to_string())?;
+            if cancellation.load(Ordering::SeqCst) {
+                return Err("Run cancelled by user".into());
+            }
             let saved = create_workspace_file_at(workspace, path.clone(), content)?;
             let changed_file = ChangedFile {
                 path: saved.path.clone(),
@@ -1168,14 +1449,14 @@ async fn execute_tool(
             Ok(ToolExecution {
                 output: serde_json::to_string(&saved)
                     .map_err(|error| format!("Workspace file could not be encoded: {error}"))?,
-                changed_file: Some(changed_file),
+                changed_files: vec![changed_file],
                 ok: true,
             })
         }
         "git_status" => Ok(ToolExecution {
             output: serde_json::to_string(&git_snapshot_at(workspace)?)
                 .map_err(|error| format!("Git status could not be encoded: {error}"))?,
-            changed_file: None,
+            changed_files: Vec::new(),
             ok: true,
         }),
         "git_diff" => {
@@ -1189,7 +1470,7 @@ async fn execute_tool(
                 .ok_or_else(|| "Tool argument 'staged' must be a boolean".to_string())?;
             Ok(ToolExecution {
                 output: git_diff_at(workspace, staged, path)?,
-                changed_file: None,
+                changed_files: Vec::new(),
                 ok: true,
             })
         }
@@ -1259,6 +1540,7 @@ async fn send_responses_request(
     instructions: &str,
     input: &[Value],
     allow_tools: bool,
+    profile: AgentProfile,
     allow_delegate: bool,
 ) -> Result<reqwest::Response, String> {
     if provider.model.trim().is_empty() {
@@ -1274,7 +1556,7 @@ async fn send_responses_request(
         "include": ["reasoning.encrypted_content"]
     });
     if allow_tools {
-        body["tools"] = json!(tool_definitions(allow_delegate));
+        body["tools"] = json!(tool_definitions(profile, allow_delegate));
         body["tool_choice"] = json!("auto");
         body["parallel_tool_calls"] = json!(false);
     }
@@ -1477,6 +1759,7 @@ async fn run_responses_agent(
                 &round_instructions,
                 &input,
                 allow_tools,
+                agent.profile,
                 allow_tools && agent.allow_delegate,
             );
             tokio::pin!(request_future);
@@ -1536,6 +1819,18 @@ async fn run_responses_agent(
 
         input.extend(round.output_items);
         for call in round.tool_calls {
+            if cancellation.load(Ordering::SeqCst) {
+                emit_agent(
+                    on_event,
+                    store,
+                    request,
+                    sequence,
+                    "run.cancelled",
+                    json!({ "reason": "user" }),
+                    agent,
+                )?;
+                return Ok(None);
+            }
             emit_agent(
                 on_event,
                 store,
@@ -1553,8 +1848,41 @@ async fn run_responses_agent(
                 agent,
             )?;
             let started = Instant::now();
+            if !agent.profile.allows_tool(&call.name)
+                || (call.name == "delegate_task" && !agent.allow_delegate)
+            {
+                let output = format!(
+                    "The {} agent profile is not permitted to use {}",
+                    agent.profile.as_str(),
+                    call.name
+                );
+                emit_agent(
+                    on_event,
+                    store,
+                    request,
+                    sequence,
+                    "tool.failed",
+                    json!({
+                        "item": {
+                            "type": "function_call",
+                            "callId": call.call_id,
+                            "name": call.name,
+                        },
+                        "ok": false,
+                        "durationMs": started.elapsed().as_millis(),
+                        "output": output,
+                    }),
+                    agent,
+                )?;
+                input.push(json!({
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": output,
+                }));
+                continue;
+            }
             let execution = if call.name == "delegate_task" {
-                let result = (|| -> Result<(String, String, String), String> {
+                let result = (|| -> Result<(String, String, AgentProfile, String), String> {
                     if !agent.allow_delegate {
                         return Err("Subagents cannot delegate another task".into());
                     }
@@ -1567,6 +1895,7 @@ async fn run_responses_agent(
                         .map_err(|error| format!("delegate_task arguments are invalid: {error}"))?;
                     let name = required_string(&arguments, "name")?.trim();
                     let role = required_string(&arguments, "role")?.trim();
+                    let profile = AgentProfile::parse(required_string(&arguments, "profile")?)?;
                     let task = required_string(&arguments, "task")?.trim();
                     if name.is_empty() || role.is_empty() || task.is_empty() {
                         return Err("delegate_task name, role, and task are required".into());
@@ -1577,15 +1906,15 @@ async fn run_responses_agent(
                     {
                         return Err("delegate_task arguments exceed their size limit".into());
                     }
-                    Ok((name.to_owned(), role.to_owned(), task.to_owned()))
+                    Ok((name.to_owned(), role.to_owned(), profile, task.to_owned()))
                 })();
                 match result {
                     Err(error) => ToolExecution {
                         output: json!({ "error": error }).to_string(),
-                        changed_file: None,
+                        changed_files: Vec::new(),
                         ok: false,
                     },
-                    Ok((name, role, task)) => {
+                    Ok((name, role, profile, task)) => {
                         budget.delegated += 1;
                         let child = AgentContext {
                             id: format!("{}-agent-{}", request.run_id, budget.delegated),
@@ -1594,6 +1923,7 @@ async fn run_responses_agent(
                             role,
                             task,
                             allow_delegate: false,
+                            profile,
                         };
                         emit(
                             on_event,
@@ -1606,6 +1936,7 @@ async fn run_responses_agent(
                                 "parentAgentId": agent.id,
                                 "name": child.name,
                                 "role": child.role,
+                                "profile": child.profile.as_str(),
                                 "task": child.task,
                                 "model": request.provider.model,
                                 "status": "working",
@@ -1632,7 +1963,27 @@ async fn run_responses_agent(
                         ))
                         .await
                         {
-                            Ok(None) => return Ok(None),
+                            Ok(None) => {
+                                emit(
+                                    on_event,
+                                    store,
+                                    request,
+                                    sequence,
+                                    "agent.completed",
+                                    json!({
+                                        "agentId": child.id,
+                                        "parentAgentId": agent.id,
+                                        "name": child.name,
+                                        "role": child.role,
+                                        "profile": child.profile.as_str(),
+                                        "task": child.task,
+                                        "model": request.provider.model,
+                                        "status": "cancelled",
+                                        "delegateCallId": call.call_id,
+                                    }),
+                                )?;
+                                return Ok(None);
+                            }
                             Ok(Some(outcome)) => {
                                 emit(
                                     on_event,
@@ -1645,6 +1996,7 @@ async fn run_responses_agent(
                                         "parentAgentId": agent.id,
                                         "name": child.name,
                                         "role": child.role,
+                                        "profile": child.profile.as_str(),
                                         "task": child.task,
                                         "model": request.provider.model,
                                         "status": "completed",
@@ -1661,7 +2013,7 @@ async fn run_responses_agent(
                                         "result": outcome.text,
                                     })
                                     .to_string(),
-                                    changed_file: None,
+                                    changed_files: Vec::new(),
                                     ok: true,
                                 }
                             }
@@ -1677,6 +2029,7 @@ async fn run_responses_agent(
                                         "parentAgentId": agent.id,
                                         "name": child.name,
                                         "role": child.role,
+                                        "profile": child.profile.as_str(),
                                         "task": child.task,
                                         "model": request.provider.model,
                                         "status": "failed",
@@ -1691,7 +2044,7 @@ async fn run_responses_agent(
                                         "error": error,
                                     })
                                     .to_string(),
-                                    changed_file: None,
+                                    changed_files: Vec::new(),
                                     ok: false,
                                 }
                             }
@@ -1705,12 +2058,12 @@ async fn run_responses_agent(
                     Ok(execution) => execution,
                     Err(error) => ToolExecution {
                         output: json!({ "error": error }).to_string(),
-                        changed_file: None,
+                        changed_files: Vec::new(),
                         ok: false,
                     },
                 }
             };
-            if let Some(change) = execution.changed_file.as_ref() {
+            for change in &execution.changed_files {
                 emit_agent(
                     on_event,
                     store,
@@ -1725,6 +2078,36 @@ async fn run_responses_agent(
                     }),
                     agent,
                 )?;
+            }
+            if cancellation.load(Ordering::SeqCst) {
+                emit_agent(
+                    on_event,
+                    store,
+                    request,
+                    sequence,
+                    "tool.failed",
+                    json!({
+                        "item": {
+                            "type": "function_call",
+                            "callId": call.call_id,
+                            "name": call.name,
+                        },
+                        "ok": false,
+                        "durationMs": started.elapsed().as_millis(),
+                        "output": "Run cancelled by user",
+                    }),
+                    agent,
+                )?;
+                emit_agent(
+                    on_event,
+                    store,
+                    request,
+                    sequence,
+                    "run.cancelled",
+                    json!({ "reason": "user" }),
+                    agent,
+                )?;
+                return Ok(None);
             }
             emit_agent(
                 on_event,
@@ -1751,7 +2134,7 @@ async fn run_responses_agent(
             input.push(json!({
                 "type": "function_call_output",
                 "call_id": call.call_id,
-                "output": execution.output,
+                "output": model_tool_output(&execution.output),
             }));
         }
     }
@@ -1780,15 +2163,11 @@ pub async fn runtime_start(
             request.branch, actual_branch
         ));
     }
-    let cancellation = Arc::new(AtomicBool::new(false));
-    control
-        .cancellations
-        .lock()
-        .map_err(|_| "Runtime cancellation state is unavailable".to_string())?
-        .insert(request.run_id.clone(), cancellation.clone());
+    let cancellation = control.register(&request.run_id)?;
     let _registration = RunRegistration {
         control: &control,
         run_id: request.run_id.clone(),
+        cancellation: cancellation.clone(),
     };
 
     let mut sequence = 0;
@@ -1822,6 +2201,7 @@ pub async fn runtime_start(
             role: "Orchestrator".into(),
             task: request.prompt.clone(),
             allow_delegate: true,
+            profile: AgentProfile::Root,
         };
         let mut budget = AgentBudget::default();
         let result = run_responses_agent(
@@ -1891,7 +2271,7 @@ pub async fn runtime_start(
     )?;
 
     let system = format!(
-        "You are the model connected to Traceframe, a transparent desktop coding workspace. The selected repository is {} on branch {}. This adapter currently provides conversation and trace streaming only: do not claim you read, changed, tested, or executed files. Give concrete guidance and clearly identify actions that still need a tool-enabled agent. Durable session summary:\n{}\n\nScoped durable memories (the current explicit request wins if any memory conflicts):\n{}",
+        "You are the model connected to Traceframe, a transparent desktop coding workspace. The selected repository is {} on branch {}. This adapter currently provides conversation and trace streaming only: do not claim you read, changed, tested, or executed files. You cannot create or update durable Memory records, so never claim information was saved for future sessions; ask the user to save it explicitly in the Memory panel. Give concrete guidance and clearly identify actions that still need a tool-enabled agent. Durable session summary:\n{}\n\nScoped durable memories (the current explicit request wins if any memory conflicts):\n{}",
         request.workspace_path,
         request.branch,
         summary_for_prompt(&summary, &request.prompt),
@@ -1920,7 +2300,7 @@ pub async fn runtime_start(
             &cancellation,
         )
         .await
-    } else if matches!(request.provider.adapter.as_str(), "openai-chat" | "google") {
+    } else if request.provider.adapter == "openai-chat" {
         let mut messages = vec![json!({ "role": "system", "content": system })];
         messages.extend(history.iter().map(|message| {
             json!({
@@ -1981,11 +2361,6 @@ pub async fn runtime_start(
             "run.failed",
             json!({ "error": error }),
         );
-        control
-            .cancellations
-            .lock()
-            .ok()
-            .map(|mut runs| runs.remove(&request.run_id));
         return Err(error);
     }
 
@@ -2006,11 +2381,6 @@ pub async fn runtime_start(
                 "run.cancelled",
                 json!({ "reason": "user" }),
             )?;
-            control
-                .cancellations
-                .lock()
-                .ok()
-                .map(|mut runs| runs.remove(&request.run_id));
             return Ok(());
         }
         let chunk = match tokio::time::timeout(Duration::from_millis(150), stream.next()).await {
@@ -2092,6 +2462,17 @@ pub async fn runtime_start(
         }
     }
 
+    if !done {
+        let error = if is_anthropic {
+            "Anthropic stream ended before message_stop"
+        } else {
+            "Chat stream ended before [DONE]"
+        }
+        .to_string();
+        emit_run_failed(&on_event, &store, &request, &mut sequence, &error);
+        return Err(error);
+    }
+
     if output.trim().is_empty() {
         let error = "Model stream completed without text output".to_string();
         emit_run_failed(&on_event, &store, &request, &mut sequence, &error);
@@ -2137,11 +2518,14 @@ pub fn runtime_cancel(run_id: String, control: State<'_, RuntimeControl>) -> Res
 mod tests {
     use super::{
         agent_instructions, anthropic_delta, anthropic_usage, api_url, await_cancellable_response,
-        changed_line_range, merge_usage, parse_sse_data, provider_healthcheck_with_timeout,
-        response_failure, response_output_text, responses_input, run_responses_agent,
-        send_anthropic_request, send_responses_request, take_sse_block, terminate_child,
-        tool_definitions, AgentBudget, AgentContext, MemoryRecord, MessageRecord, ProviderConfig,
-        RuntimeRequest, ANTHROPIC_MAX_TOKENS, MAX_ERROR_BYTES, MAX_TOOL_ROUNDS,
+        changed_command_files, changed_line_range, command_file_states, diff_changed_range,
+        execute_tool, merge_usage, model_tool_output, parse_sse_data,
+        provider_healthcheck_with_timeout, read_bounded_output, response_failure,
+        response_output_text, responses_input, run_responses_agent, send_anthropic_request,
+        send_responses_request, take_sse_block, terminate_child, tool_definitions, AgentBudget,
+        AgentContext, AgentProfile, MemoryRecord, MessageRecord, ProviderConfig, RuntimeControl,
+        RuntimeRequest, ANTHROPIC_MAX_TOKENS, MAX_ERROR_BYTES, MAX_MODEL_TOOL_OUTPUT_CHARS,
+        MAX_TOOL_ROUNDS,
     };
     use crate::{store::AppStore, WorkspaceAccess};
     use serde_json::json;
@@ -2151,6 +2535,7 @@ mod tests {
     use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
+    use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
     fn provider(endpoint: String) -> ProviderConfig {
@@ -2174,6 +2559,124 @@ mod tests {
         assert_eq!(changed_line_range("one\ntwo\nthree", "one\nthree"), (2, 2));
         assert_eq!(changed_line_range("one\ntwo", "one"), (1, 1));
         assert_eq!(changed_line_range("", "first\nsecond"), (1, 2));
+    }
+
+    #[test]
+    fn command_change_detection_tracks_new_and_repeated_file_edits() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("traceframe-command-change-{nonce}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("tracked.txt"), "one\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&[
+            "-c",
+            "user.name=Traceframe Test",
+            "-c",
+            "user.email=traceframe@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ]);
+        let workspace = root.canonicalize().unwrap();
+        let clean = command_file_states(&workspace);
+        assert!(clean.is_empty());
+
+        std::fs::write(workspace.join("tracked.txt"), "one\ntwo\n").unwrap();
+        let first = command_file_states(&workspace);
+        let first_changes = changed_command_files(&clean, &first);
+        assert_eq!(first_changes.len(), 1);
+        assert_eq!(first_changes[0].path, "tracked.txt");
+        assert_eq!(
+            diff_changed_range("@@ -1 +1,2 @@\n one\n+two"),
+            Some((1, 2))
+        );
+
+        std::fs::write(workspace.join("tracked.txt"), "one\ntwo\nthree\n").unwrap();
+        let second = command_file_states(&workspace);
+        assert_eq!(changed_command_files(&first, &second).len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_control_rejects_duplicate_active_run_ids() {
+        let control = RuntimeControl::default();
+        let first = control.register("run-1").unwrap();
+        assert!(control
+            .register("run-1")
+            .unwrap_err()
+            .contains("already active"));
+        control.unregister("run-1", &Arc::new(AtomicBool::new(false)));
+        assert!(control.register("run-1").is_err());
+        control.unregister("run-1", &first);
+        assert!(control.register("run-1").is_ok());
+    }
+
+    #[test]
+    fn model_tool_output_is_bounded_with_an_actionable_notice() {
+        assert_eq!(model_tool_output("small"), "small");
+        let bounded = model_tool_output(&"x".repeat(MAX_MODEL_TOOL_OUTPUT_CHARS + 200));
+        let value: serde_json::Value = serde_json::from_str(&bounded).unwrap();
+        assert_eq!(value["truncated"], true);
+        assert!(value["notice"]
+            .as_str()
+            .unwrap()
+            .contains("Re-run a narrower"));
+        assert!(
+            value["output"].as_str().unwrap().chars().count() <= MAX_MODEL_TOOL_OUTPUT_CHARS + 3
+        );
+    }
+
+    #[test]
+    fn bounded_output_drains_the_reader_after_retention_limit() {
+        tauri::async_runtime::block_on(async {
+            let (mut writer, reader) = tokio::io::duplex(64);
+            let write = tokio::spawn(async move {
+                writer.write_all(&vec![b'x'; 4096]).await.unwrap();
+                writer.shutdown().await.unwrap();
+            });
+            let (retained, truncated) = read_bounded_output(reader, 16).await.unwrap();
+            write.await.unwrap();
+            assert_eq!(retained, vec![b'x'; 16]);
+            assert!(truncated);
+        });
+    }
+
+    #[test]
+    fn cancellation_blocks_mutating_tools_before_they_write() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("traceframe-cancel-test-{nonce}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = root.canonicalize().unwrap();
+        let access = WorkspaceAccess::default();
+        access.register(workspace.clone()).unwrap();
+        let cancellation = AtomicBool::new(true);
+        let error = tauri::async_runtime::block_on(execute_tool(
+            "create_file",
+            r#"{"path":"blocked.txt","content":"must not exist"}"#,
+            &workspace,
+            &access,
+            &cancellation,
+        ))
+        .unwrap_err();
+        assert!(error.contains("cancelled"));
+        assert!(!workspace.join("blocked.txt").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn serve_once(status: u16, body: Vec<u8>, body_delay: Duration) -> String {
@@ -2472,20 +2975,34 @@ mod tests {
         ];
 
         tauri::async_runtime::block_on(async {
-            let first = send_responses_request(&provider, "Use tools", &first_input, true, true)
-                .await
-                .unwrap();
+            let first = send_responses_request(
+                &provider,
+                "Use tools",
+                &first_input,
+                true,
+                AgentProfile::Root,
+                true,
+            )
+            .await
+            .unwrap();
             assert!(first.status().is_success());
-            let second =
-                send_responses_request(&provider, "Use tools", &continued_input, true, true)
-                    .await
-                    .unwrap();
+            let second = send_responses_request(
+                &provider,
+                "Use tools",
+                &continued_input,
+                true,
+                AgentProfile::Root,
+                true,
+            )
+            .await
+            .unwrap();
             assert!(second.status().is_success());
             let final_response = send_responses_request(
                 &provider,
                 "Return the final answer",
                 &continued_input,
                 false,
+                AgentProfile::Root,
                 false,
             )
             .await
@@ -2528,6 +3045,7 @@ mod tests {
             "Use tools",
             &[json!({ "role": "user", "content": "Inspect" })],
             true,
+            AgentProfile::Root,
             true,
         ))
         .unwrap_err();
@@ -2536,7 +3054,7 @@ mod tests {
 
     #[test]
     fn responses_tools_are_strict_and_cover_the_workspace_loop() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions(AgentProfile::Root, true);
         let names = tools
             .iter()
             .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
@@ -2556,16 +3074,25 @@ mod tests {
             ]
         );
         assert!(tools.iter().all(|tool| tool["strict"] == true));
-        let child_tools = tool_definitions(false);
-        assert!(child_tools
+        let worker_tools = tool_definitions(AgentProfile::Worker, false);
+        assert!(worker_tools
             .iter()
             .all(|tool| tool["name"] != "delegate_task"));
+        let scout_tools = tool_definitions(AgentProfile::Scout, false);
+        let scout_names = scout_tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scout_names,
+            vec!["list_files", "read_file", "git_status", "git_diff"]
+        );
         let delegate = tools
             .iter()
             .find(|tool| tool["name"] == "delegate_task")
             .unwrap();
         let properties = delegate["parameters"]["properties"].as_object().unwrap();
-        assert_eq!(properties.len(), 3);
+        assert_eq!(properties.len(), 4);
         assert!(!properties.contains_key("workspace"));
         assert!(!properties.contains_key("provider"));
         assert!(!properties.contains_key("model"));
@@ -2574,7 +3101,7 @@ mod tests {
     #[test]
     fn responses_agent_runs_a_bounded_auditable_specialist() {
         let root_delegate = concat!(
-            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"call_id\":\"delegate-1\",\"name\":\"delegate_task\",\"arguments\":\"{\\\"name\\\":\\\"Audit\\\",\\\"role\\\":\\\"Test\\\",\\\"task\\\":\\\"Read note.txt and report its content\\\"}\"}],\"usage\":{\"input_tokens\":10}}}\n\n"
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"call_id\":\"delegate-1\",\"name\":\"delegate_task\",\"arguments\":\"{\\\"name\\\":\\\"Audit\\\",\\\"role\\\":\\\"Test\\\",\\\"profile\\\":\\\"reviewer\\\",\\\"task\\\":\\\"Read note.txt and report its content\\\"}\"}],\"usage\":{\"input_tokens\":10}}}\n\n"
         );
         let child_read = concat!(
             "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"call_id\":\"read-1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"note.txt\\\"}\"}],\"usage\":{\"input_tokens\":8}}}\n\n"
@@ -2639,6 +3166,7 @@ mod tests {
             role: "Orchestrator".into(),
             task: request.prompt.clone(),
             allow_delegate: true,
+            profile: AgentProfile::Root,
         };
         let mut budget = AgentBudget::default();
         let outcome = tauri::async_runtime::block_on(run_responses_agent(
@@ -2784,6 +3312,7 @@ mod tests {
             role: "Orchestrator".into(),
             task: request.prompt.clone(),
             allow_delegate: true,
+            profile: AgentProfile::Root,
         };
         let mut budget = AgentBudget::default();
 
@@ -2896,6 +3425,7 @@ mod tests {
             role: "Orchestrator".into(),
             task: request.prompt.clone(),
             allow_delegate: true,
+            profile: AgentProfile::Root,
         };
         let mut budget = AgentBudget::default();
 
@@ -3100,9 +3630,54 @@ mod tests {
     #[cfg(unix)]
     fn terminate_child_kills_and_reaps_the_process() {
         tauri::async_runtime::block_on(async {
-            let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+            let mut command = Command::new("/bin/sleep");
+            command.arg("30").process_group(0);
+            let mut child = command.spawn().unwrap();
             terminate_child(&mut child).await.unwrap();
             assert!(child.try_wait().unwrap().is_some());
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminate_child_stops_the_spawned_process_group() {
+        tauri::async_runtime::block_on(async {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let pid_file = std::env::temp_dir().join(format!("traceframe-child-pid-{nonce}"));
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg("sleep 30 & echo $! > \"$TRACEFRAME_PID_FILE\"; wait")
+                .env("TRACEFRAME_PID_FILE", &pid_file)
+                .process_group(0);
+            let mut child = command.spawn().unwrap();
+            for _ in 0..100 {
+                if pid_file.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let descendant = std::fs::read_to_string(&pid_file).unwrap();
+            terminate_child(&mut child).await.unwrap();
+            let mut alive = true;
+            for _ in 0..100 {
+                alive = std::process::Command::new("/bin/kill")
+                    .args(["-0", descendant.trim()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success();
+                if !alive {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(!alive, "descendant process survived cancellation");
+            let _ = std::fs::remove_file(pid_file);
         });
     }
 }

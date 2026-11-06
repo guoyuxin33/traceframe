@@ -936,12 +936,14 @@ kbd,
 
 .prompt-queue-row {
   display: grid;
-  grid-template-columns: 24px minmax(0, 1fr) 28px;
+  grid-template-columns: 24px minmax(0, 1fr) 28px 28px;
   min-height: 36px;
   align-items: center;
   color: var(--text-secondary);
   gap: 4px;
 }
+
+.prompt-queue-row button:last-child { grid-column: 4; }
 
 .prompt-queue-row + .prompt-queue-row { border-top: 1px solid var(--line); }
 .prompt-queue-row > span { color: var(--accent); font-family: 'IBM Plex Mono', monospace; font-size: 9px; text-align: center; }
@@ -1608,6 +1610,9 @@ kbd,
   line-height: 18px;
   white-space: pre-wrap;
 }
+.terminal-view details { margin-left: 16px; color: var(--text-muted); }
+.terminal-view summary { width: max-content; cursor: pointer; font-size: 10px; }
+.terminal-view details[open] summary { color: var(--text-secondary); }
 .cursor-block { display: inline-block; width: 6px; height: 12px; margin-left: 6px; background: var(--text-secondary); vertical-align: -2px; }
 
 .trace-list {
@@ -1953,19 +1958,24 @@ kbd,
 .agent-state {
   color: var(--text-muted);
   font-family: 'IBM Plex Mono', monospace;
-  font-size: 8px;
+  font-size: 9px;
 }
 
 .agent-state.state-working { color: var(--accent); }
 .agent-state.state-done { color: var(--positive); }
+.agent-state.state-idle { color: var(--text-secondary); }
+.agent-state.state-failed { color: var(--negative); }
+.agent-state.state-cancelled { color: var(--amber); }
 
 .agent-node p { margin: 8px 0; color: var(--text-secondary); font-size: 10px; }
 .agent-progress { height: 2px; overflow: hidden; background: var(--surface-raised); }
 .agent-progress span { display: block; height: 100%; background: var(--accent); }
 .agent-node.state-done .agent-progress span { background: var(--positive); }
 .agent-node.state-queued .agent-progress span { background: var(--text-muted); }
+.agent-node.state-failed .agent-progress span { background: var(--negative); }
+.agent-node.state-cancelled .agent-progress span { background: var(--amber); }
 
-.agent-node footer { display: flex; justify-content: space-between; margin-top: 6px; color: var(--text-muted); font-family: 'IBM Plex Mono', monospace; font-size: 8px; }
+.agent-node footer { display: flex; justify-content: space-between; margin-top: 6px; color: var(--text-muted); font-family: 'IBM Plex Mono', monospace; font-size: 9px; }
 .agent-node footer b { font-weight: 400; }
 
 .add-agent-button {
@@ -2552,6 +2562,13 @@ kbd,
 
 .provider-row input:focus,
 .provider-row select:focus { border-color: rgba(98, 217, 187, 0.45); }
+
+.provider-mode-detail {
+  margin: 0 0 4px 104px;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 16px;
+}
 
 .settings-drawer > footer {
   display: flex;

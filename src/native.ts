@@ -1,5 +1,5 @@
 import { Channel, invoke } from '@tauri-apps/api/core'
-import type { MemoryRecord, Message, Provider, RuntimeEventRecord, Session } from './types'
+import type { MemoryRecord, Message, Provider, RuntimeEventRecord, RuntimeEventType, Session } from './types'
 
 export interface NativeCapabilities {
   platform: string
@@ -175,7 +175,7 @@ export async function getAppSnapshot(): Promise<AppSnapshot> {
       type: (memory.kind || 'Decision') as MemoryRecord['type'],
       time: displayTime(memory.createdAt),
     })),
-    events: snapshot.events.map(({ eventType, createdAt, ...event }) => ({ ...event, type: eventType, timestamp: createdAt })),
+    events: snapshot.events.map(({ eventType, createdAt, ...event }) => ({ ...event, type: eventType as RuntimeEventType, timestamp: createdAt })),
   }
 }
 

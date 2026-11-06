@@ -18,6 +18,7 @@ This project has no tagged public release yet. The current package version is `0
 - Official current OpenAI text/code model catalog reference in settings.
 - Line-aware agent edit following that activates Code, opens the changed file, centers and marks the affected range, and can be paused for manual navigation.
 - Per-session follow-up prompt queues with Enter-to-send, Shift+Enter multiline input, visible ordering, removal, and automatic serial execution.
+- Host-enforced `scout`, `reviewer`, and `worker` child-agent profiles with read-only tool boundaries for investigation and review.
 
 ### Changed
 
@@ -28,6 +29,8 @@ This project has no tagged public release yet. The current package version is `0
 - Non-Responses provider requests can be cancelled while waiting for response headers and record terminal failures consistently.
 - Responses runs use a tools-disabled synthesis request after exhausting their tool-round budget instead of failing immediately after the last successful tool call.
 - File paths emitted by mutating runtime tools are normalized before renderer navigation.
+- Active tool results are bounded before re-entering model context, while command output pipes continue draining to EOF.
+- Chat and Anthropic streams require their terminal frame before a reply is persisted as complete.
 
 ### Fixed
 
@@ -35,6 +38,12 @@ This project has no tagged public release yet. The current package version is `0
 - Cancelling the picker or selecting a non-Git directory preserves the last successfully loaded workspace, and invalid directories are not saved as recent workspaces.
 - Manual file navigation and unsaved editor drafts no longer lose races with pending agent-follow refreshes.
 - Agent edit navigation runs once per event and no longer resets the caret while the user continues editing.
+- Entering editor mode at an agent change now positions a caret without selecting a destructive replacement range.
+- Stopping a run preserves queued prompts and pauses them for explicit resume instead of deleting them.
+- Failed and cancelled child agents keep distinct terminal states in the Agents panel.
+- Untracked text files render as complete added-file diffs from their bounded preview.
+- Trace hides per-delta stream fragments, and Output keeps tool payloads collapsed until requested.
+- Formatter and generator changes made through bounded commands emit file-change events for Trace and editor following.
 
 ### Security
 

@@ -21,7 +21,9 @@ import {
   providerTestError,
   requestRunCancellation,
   requestWorkspaceSelection,
+  runtimeAgentState,
   shouldFocusPromptShortcut,
+  untrackedFileDiff,
   validateWorkspaceCandidate,
 } from './App'
 import type { Provider, Session } from './types'
@@ -182,6 +184,23 @@ describe('conversation controls', () => {
     expect(onRemoveQueued).toHaveBeenCalledWith('queued-1')
     await user.type(composer, 'Inspect the changed files{enter}')
     await waitFor(() => expect(onSend).toHaveBeenCalledWith('Inspect the changed files'))
+  })
+
+  it('lets a stopped queue resume explicitly without duplicating the prompt', async () => {
+    const user = userEvent.setup()
+    const onRunQueued = vi.fn().mockResolvedValue(undefined)
+    render(<ConversationPanel
+      session={activeSession}
+      messages={[]}
+      agents={[]}
+      disabled={false}
+      queuedPrompts={[{ id: 'queued-1', sessionId: activeSession.id, text: 'Continue after review' }]}
+      onSend={vi.fn().mockResolvedValue(true)}
+      onRunQueued={onRunQueued}
+    />)
+
+    await user.click(screen.getByRole('button', { name: '运行下一条排队消息' }))
+    expect(onRunQueued).toHaveBeenCalledWith(expect.objectContaining({ id: 'queued-1', text: 'Continue after review' }))
   })
 })
 
@@ -465,6 +484,13 @@ describe('context controls', () => {
 })
 
 describe('agent controls', () => {
+  it('keeps failed, cancelled, and idle states distinct from completion', () => {
+    expect(runtimeAgentState('failed', 'agent.completed')).toBe('failed')
+    expect(runtimeAgentState('cancelled', 'agent.completed')).toBe('cancelled')
+    expect(runtimeAgentState('ready', 'agent.completed')).toBe('idle')
+    expect(runtimeAgentState('completed', 'agent.completed')).toBe('done')
+  })
+
   it('adds a configured specialist in preview mode', async () => {
     const user = userEvent.setup()
     const onAdd = vi.fn()
@@ -490,7 +516,7 @@ describe('agent controls', () => {
     render(<AgentPanel agents={[]} onAdd={onAdd} orchestrated />)
 
     expect(screen.queryByRole('button', { name: 'Add specialist' })).not.toBeInTheDocument()
-    expect(screen.getByText(/主智能体可串行委派最多 4 个受限子任务/)).toBeVisible()
+    expect(screen.getByText(/scout\/reviewer 只读，worker 可写入/)).toBeVisible()
     expect(onAdd).not.toHaveBeenCalled()
   })
 })
@@ -753,7 +779,7 @@ describe('narrow editor toolbar', () => {
     expect(onFollowAgent).toHaveBeenCalledWith(false)
   })
 
-  it('selects the changed range in edit mode without replacing the draft', async () => {
+  it('moves the caret to an agent edit without selecting code that typing could replace', async () => {
     const commonProps = {
       file: { path: 'note.txt', content: 'alpha\nbeta\ngamma', size: 16, truncated: false },
       loading: false,
@@ -780,7 +806,7 @@ describe('narrow editor toolbar', () => {
 
     const editor = screen.getByRole('textbox', { name: '编辑 note.txt' }) as HTMLTextAreaElement
     await waitFor(() => expect(editor.selectionStart).toBe(6))
-    expect(editor.selectionEnd).toBe(16)
+    expect(editor.selectionEnd).toBe(6)
     expect(editor).toHaveValue('alpha\nlocal beta\ngamma')
     expect(screen.getByRole('button', { name: /Blocked/ })).toHaveAttribute('aria-pressed', 'true')
 
@@ -795,7 +821,7 @@ describe('narrow editor toolbar', () => {
 describe('agent edit event validation', () => {
   const event = (payload: Record<string, unknown>) => ({
     id: 'event-1', sessionId: 'session-1', runId: 'run-1', sequence: 1,
-    type: 'file.changed', payload, timestamp: Date.now(),
+    type: 'file.changed' as const, payload, timestamp: Date.now(),
   })
 
   it('uses a safe first-line fallback when older runtimes omit line metadata', () => {
@@ -809,5 +835,18 @@ describe('agent edit event validation', () => {
     expect(agentEditTarget(event({ path: '../secret.txt', startLine: 4 }))).toBeNull()
     expect(agentEditTarget(event({ path: '/tmp/secret.txt', startLine: 4 }))).toBeNull()
     expect(agentEditTarget(event({ path: 'src\\secret.txt', startLine: 4 }))).toBeNull()
+  })
+})
+
+describe('untracked diff', () => {
+  it('renders a complete added-file patch from the bounded preview', () => {
+    expect(untrackedFileDiff({ path: 'src/new.ts', content: 'one\ntwo', size: 7, truncated: false })).toContain([
+      '--- /dev/null',
+      '+++ b/src/new.ts',
+      '@@ -0,0 +1,2 @@',
+      '+one',
+      '+two',
+    ].join('\n'))
+    expect(untrackedFileDiff({ path: 'large.txt', content: 'partial', size: 100, truncated: true })).toBe('')
   })
 })

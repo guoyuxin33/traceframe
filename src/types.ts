@@ -1,4 +1,4 @@
-export type AgentState = 'working' | 'done' | 'queued'
+export type AgentState = 'idle' | 'queued' | 'working' | 'done' | 'failed' | 'cancelled'
 
 export interface Agent {
   id: string
@@ -45,7 +45,7 @@ export interface Provider {
   name: string
   endpoint: string
   model: string
-  adapter: 'cc-switch-responses' | 'openai-responses' | 'openai-chat' | 'anthropic' | 'google'
+  adapter: 'cc-switch-responses' | 'openai-responses' | 'openai-chat' | 'anthropic'
   connected: boolean
   latency: number
   detail?: string
@@ -68,12 +68,27 @@ export interface MemoryRecord {
   createdAt?: number
 }
 
+export type RuntimeEventType =
+  | 'run.created'
+  | 'run.completed'
+  | 'run.failed'
+  | 'run.cancelled'
+  | 'agent.started'
+  | 'agent.completed'
+  | 'model.requested'
+  | 'model.delta'
+  | 'tool.started'
+  | 'tool.completed'
+  | 'tool.failed'
+  | 'file.changed'
+  | 'context.compacted'
+
 export interface RuntimeEventRecord {
   id: string
   sessionId: string
   runId: string
   sequence: number
-  type: string
+  type: RuntimeEventType
   payload: Record<string, unknown>
   timestamp: number
 }

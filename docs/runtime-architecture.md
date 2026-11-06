@@ -18,6 +18,18 @@ The Rust host owns workspace authorization, provider requests, the root and spec
 
 Traceframe does not start Codex. Pi and pi-agent are architecture references only; no Pi process or SDK is connected.
 
+## Pi-derived loop boundaries
+
+Traceframe follows the useful boundaries in Pi's agent design without importing its Node runtime:
+
+- the Rust host owns a provider-neutral run loop, cancellation, workspace authority, tool execution, and durable event order;
+- provider adapters translate wire formats, while the canonical transcript keeps complete model output items and normalized tool results;
+- follow-up prompts are a distinct next-run queue rather than being mixed into the active request;
+- child capabilities are host-owned profiles, so a model can choose a suitable specialist but cannot grant it broader tools;
+- every tool result is transformed to a bounded model-facing representation before the next provider request, while the trace keeps a separately bounded audit representation.
+
+Pi-style steering, where a new user instruction is injected after the current assistant/tool turn, is not implemented yet. Traceframe currently exposes only the separate visible follow-up queue. Keeping those semantics distinct avoids silently changing an in-flight coding decision.
+
 ## Responses agent
 
 The `cc-switch-responses` and `openai-responses` adapters use the same Traceframe-owned loop:
@@ -30,7 +42,7 @@ The `cc-switch-responses` and `openai-responses` adapters use the same Tracefram
 
 Implemented tools are `list_files`, `read_file`, `edit_file`, `write_file`, `create_file`, `git_status`, `git_diff`, and `run_command`. Mutating file tools use the same authorized-root and conflict checks as the editor. Commands run directly without a shell and have program, argument-count, output-size, and timeout limits.
 
-The root loop also receives a strict `delegate_task` tool. It may run up to four specialists serially. Each specialist inherits the selected provider, model, authorized workspace, and branch, receives a focused task, has an eight-tool-round limit plus the same tools-disabled final synthesis, and cannot delegate again. Serial execution prevents concurrent writes to the same checkout. A child result returns to the root as `function_call_output`; only the root's integrated answer is appended to the conversation.
+The root loop also receives a strict `delegate_task` tool. It may run up to four specialists serially. Each specialist inherits the selected provider, model, authorized workspace, and branch, receives a focused task, has an eight-tool-round limit plus the same tools-disabled final synthesis, and cannot delegate again. The host enforces one of three profiles: `scout` and `reviewer` receive only read, tree, status, and diff tools; `worker` receives mutating file and bounded command tools as well. Tool authorization is checked again during execution even if a provider returns a tool call that was not advertised. Serial execution prevents concurrent writes to the same checkout. A child result returns to the root as `function_call_output`; only the root's integrated answer is appended to the conversation.
 
 ## Provider boundaries
 
@@ -62,9 +74,9 @@ The OpenAI settings include a small reference list from the official current tex
 
 Runtime events contain an event ID, run ID, session ID, per-run sequence number, timestamp, type, and JSON payload. Events are appended to SQLite before they are emitted over the Tauri channel. The desktop restores recent events on startup.
 
-Current events cover run creation, model requests and deltas, tool start/completion/failure, file changes, agent start/completion, usage, completion, cancellation, and failures. Mutating file tools include a normalized relative path and changed line range in `file.changed`; the renderer uses that evidence to activate Code, load the file, center the range, and mark it once. Manual navigation pauses following, duplicate event IDs are ignored, and unsaved drafts block automatic replacement until they are saved or reverted. Agent and parent-agent IDs provide the current root-to-specialist causal link. A durable general task graph remains planned.
+Current events cover run creation, model requests and deltas, tool start/completion/failure, file changes, agent start/completion, usage, completion, cancellation, and failures. Mutating file tools include a normalized relative path and changed line range in `file.changed`. Bounded commands compare per-file Git fingerprints before and after execution, so formatter and generator changes also emit file events. The renderer uses that evidence to activate Code, load the file, center the range, and mark it once. Manual navigation pauses following, duplicate event IDs are ignored, and unsaved drafts block automatic replacement until they are saved or reverted. Agent and parent-agent IDs provide the current root-to-specialist causal link. A durable general task graph remains planned.
 
-While a run owns the workspace, the conversation remains writable. Follow-up prompts are held in a visible per-session renderer queue and submitted serially after the active run completes. Stopping a run clears that session's pending turns so cancellation cannot unexpectedly start the next item. The queue is process-local; accepted messages and completed run output remain durable in SQLite.
+While a run owns the workspace, the conversation remains writable. Follow-up prompts are held in a visible per-session renderer queue and submitted serially after the active run completes. Stopping a run preserves those pending turns but pauses automatic execution; the user can remove them or explicitly run the next item. The queue is process-local; accepted messages and completed run output remain durable in SQLite.
 
 ## Sessions, context, and memory
 
@@ -76,7 +88,7 @@ Manual compaction creates a deterministic bounded summary and records a `context
 
 The Rust workspace bridge records roots selected through the native picker. It rejects parent traversal, symlink escapes, binary and non-UTF-8 files, truncated or oversized writes, and stale overwrites. Existing files are replaced atomically while preserving permissions.
 
-Git operations and command working directories start inside the authorized workspace. The command tool is not an operating-system sandbox: allowed build tools and interpreters can execute repository code with the desktop user's permissions. The planned permission broker and process isolation layer must close that broader boundary before production use.
+Git operations and command working directories start inside the authorized workspace. Commands run in their own process group on Unix so cancellation terminates the spawned process tree, and output pipes are drained to EOF while retained output remains bounded. The command tool is not an operating-system sandbox: allowed build tools and interpreters can execute repository code with the desktop user's permissions. The planned permission broker and process isolation layer must close that broader boundary before production use.
 
 ## Target multi-agent boundary
 

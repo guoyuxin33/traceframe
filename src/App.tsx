@@ -267,6 +267,7 @@ export function isRetiredOpenAiModel(model: string) {
 function loadProviders() {
   const stored = loadStored<Provider[]>('traceframe.providers', [])
     .filter((provider) => String(provider.adapter) !== 'codex-cli')
+    .map((provider) => String(provider.adapter) === 'google' ? { ...provider, adapter: 'openai-chat' as const } : provider)
   const defaults = initialProviders.map((provider) => {
     const persisted = stored.find((candidate) => candidate.id === provider.id)
     const model = persisted?.model ?? provider.model
@@ -586,6 +587,7 @@ export function ConversationPanel({
   queuedPrompts = [],
   onSend,
   onRemoveQueued = () => undefined,
+  onRunQueued = async () => undefined,
 }: {
   session: Session
   messages: Message[]
@@ -596,6 +598,7 @@ export function ConversationPanel({
   queuedPrompts?: QueuedPrompt[]
   onSend: (text: string) => Promise<boolean>
   onRemoveQueued?: (id: string) => void
+  onRunQueued?: (prompt: QueuedPrompt) => Promise<void>
 }) {
   const [drafts, setDrafts] = useState<Record<string, string>>({})
   const [submitting, setSubmitting] = useState(false)
@@ -654,6 +657,7 @@ export function ConversationPanel({
             <div className="prompt-queue-row" key={prompt.id}>
               <span>{index + 1}</span>
               <p>{prompt.text}</p>
+              {!runActive && index === 0 ? <button type="button" onClick={() => void onRunQueued(prompt)} aria-label="运行下一条排队消息" title="Run next queued message"><Play size={13} /></button> : null}
               <button type="button" onClick={() => onRemoveQueued(prompt.id)} aria-label={`移除排队消息 ${index + 1}`} title="Remove queued message"><X size={13} /></button>
             </div>
           ))}
@@ -691,6 +695,19 @@ function fileStatus(snapshot: GitSnapshot, path: string) {
   if (!state) return undefined
   const status = state.worktreeStatus !== ' ' ? state.worktreeStatus : state.indexStatus
   return status === '?' ? 'U' : status
+}
+
+export function untrackedFileDiff(file: WorkspaceFile) {
+  if (file.truncated) return ''
+  const lines = file.content ? file.content.split('\n') : []
+  const hunk = lines.length ? [`@@ -0,0 +1,${lines.length} @@`, ...lines.map((line) => `+${line}`)] : []
+  return [
+    `diff --git a/${file.path} b/${file.path}`,
+    'new file mode 100644',
+    '--- /dev/null',
+    `+++ b/${file.path}`,
+    ...hunk,
+  ].join('\n')
 }
 
 export function FileTree({
@@ -863,9 +880,8 @@ export function CodeView({
     const frame = requestAnimationFrame(() => {
       if (mode === 'edit' && canEdit && editorRef.current) {
         const beforeStart = currentLines.slice(0, startLine - 1).join('\n')
-        const throughEnd = currentLines.slice(0, endLine).join('\n')
         const startOffset = beforeStart.length + (startLine > 1 ? 1 : 0)
-        editorRef.current.setSelectionRange(startOffset, Math.max(startOffset, throughEnd.length))
+        editorRef.current.setSelectionRange(startOffset, startOffset)
         editorRef.current.scrollTop = Math.max(0, (startLine - 1) * 20 - editorRef.current.clientHeight * 0.35)
         if (gutterRef.current) gutterRef.current.scrollTop = editorRef.current.scrollTop
         return
@@ -1034,10 +1050,13 @@ function firstString(...values: unknown[]) {
   return undefined
 }
 
-function runtimeAgentState(status: unknown, eventType: string): Agent['state'] {
+export function runtimeAgentState(status: unknown, eventType: string): Agent['state'] {
   const value = String(status ?? '').toLowerCase()
+  if (['failed', 'error', 'errored'].includes(value)) return 'failed'
+  if (['cancelled', 'canceled', 'aborted', 'stopped'].includes(value)) return 'cancelled'
   if (['completed', 'complete', 'done', 'shutdown', 'closed', 'success', 'succeeded'].includes(value)) return 'done'
-  if (['queued', 'pending', 'waiting', 'idle'].includes(value)) return 'queued'
+  if (['idle', 'ready'].includes(value)) return 'idle'
+  if (['queued', 'pending', 'waiting'].includes(value)) return 'queued'
   if (['running', 'working', 'active', 'in_progress', 'in-progress', 'started'].includes(value)) return 'working'
   return eventType === 'agent.completed' ? 'done' : 'working'
 }
@@ -1051,13 +1070,15 @@ function deriveRuntimeAgents(events: RuntimeEventRecord[], root: Agent) {
     const existing = derived.get(id)
     const state = runtimeAgentState(detail.status ?? detail.state ?? source.status, event.type)
     const shortId = id.length > 12 ? id.slice(0, 8) : id
+    const role = firstString(detail.role, detail.agent_role, source.role, source.agent_role) ?? 'Subagent'
+    const profile = firstString(detail.profile, source.profile)
     derived.set(id, {
       id,
       name: firstString(detail.name, detail.agent_name, source.name, source.agent_name) ?? `Agent ${shortId}`,
-      role: firstString(detail.role, detail.agent_role, source.role, source.agent_role) ?? 'Subagent',
+      role: profile ? `${role} · ${profile}` : role,
       model: firstString(detail.model, source.model) ?? root.model,
       state,
-      progress: state === 'done' ? 100 : state === 'queued' ? 0 : 50,
+      progress: ['done', 'failed', 'cancelled'].includes(state) ? 100 : ['queued', 'idle'].includes(state) ? 0 : 50,
       parent: root.id,
       task: firstString(detail.task, detail.message, detail.prompt, source.task, source.message, source.prompt, source.tool) ?? 'Delegated task',
       color: existing?.color ?? colors[derived.size % colors.length],
@@ -1127,7 +1148,7 @@ function TerminalView({ runState, workspace, branch, events }: { runState: 'idle
         const output = firstString(event.payload.output, item?.aggregated_output)
         return <div key={event.id} className={completed ? 'terminal-muted' : event.type === 'tool.failed' ? 'terminal-error' : 'terminal-active'}>
           <span className="prompt">{completed ? '$' : event.type === 'tool.failed' ? '×' : '›'}</span> {String(item?.command ?? item?.name ?? 'tool')}
-          {output ? <pre>{output}</pre> : null}
+          {output ? <details><summary>Show output</summary><pre>{output}</pre></details> : null}
         </div>
       })}
       {runState === 'running' ? <div className="terminal-active">› Traceframe run is active</div> : <div><span className="prompt">trace@{branch}</span><span className="cursor-block" /></div>}
@@ -1136,9 +1157,10 @@ function TerminalView({ runState, workspace, branch, events }: { runState: 'idle
 }
 
 function ActivityView({ events }: { events: RuntimeEventRecord[] }) {
+  const visibleEvents = events.filter((event) => event.type !== 'model.delta')
   return (
     <div className="trace-list" role="log" aria-live="polite">
-      {events.slice(0, 100).map((event) => {
+      {visibleEvents.slice(0, 100).map((event) => {
         const item = eventItem(event)
         const detail = firstString(item?.command, item?.name, item?.text, event.payload.text, event.payload.output, event.payload.error, item?.type)
         return <article className="trace-event" key={event.id}>
@@ -1147,7 +1169,7 @@ function ActivityView({ events }: { events: RuntimeEventRecord[] }) {
           <span>{detail ?? ''}</span>
         </article>
       })}
-      {!events.length ? <div className="workspace-empty"><Activity size={18} /><strong>No runtime events</strong><p>Start a run to build an auditable trace.</p></div> : null}
+      {!visibleEvents.length ? <div className="workspace-empty"><Activity size={18} /><strong>No runtime events</strong><p>Streaming text stays in Conversation; tool and lifecycle evidence appears here.</p></div> : null}
     </div>
   )
 }
@@ -1211,6 +1233,9 @@ export function RepositoryDock({
 }: RepositoryDockProps) {
   const breadcrumbs = selectedFile.split('/').filter(Boolean)
   const workspaceCtaDisabled = interactionBusy || branchBusy || loading || editor.saving
+  const displayedDiff = diff.trim() || !workspace || !file || file.path !== selectedFile || fileStatus(workspace.snapshot, selectedFile) !== 'U'
+    ? diff
+    : untrackedFileDiff(file)
   return (
     <section className={`repository-dock${error ? ' has-error' : ''}`} aria-label={mode === 'code' ? '代码文件' : '代码差异'}>
       {error ? <div className="workspace-error"><span>{error}</span><button type="button" disabled={workspaceCtaDisabled} title={interactionBusy ? 'Stop the active run before changing workspaces' : workspaceCtaDisabled ? 'Wait for the current workspace operation to finish' : undefined} onClick={onOpenWorkspace}>Choose another folder</button></div> : null}
@@ -1256,7 +1281,7 @@ export function RepositoryDock({
                 onRevert={editor.onRevert}
                 onFollowAgent={onFollowAgent}
               />
-              : <DiffView diff={diff} path={selectedFile} loading={fileLoading} error={diffError} />}
+              : <DiffView diff={displayedDiff} path={selectedFile} loading={fileLoading} error={diffError} />}
           </div>
         </div>
       </div>
@@ -1283,7 +1308,7 @@ export function ContextPanel({ session, messages, events, memories, onCompact, c
     <div className="inspector-scroll">
       <section className="context-summary">
         <div className="context-meter">
-          <svg viewBox="0 0 88 88" aria-label={`最近消息窗口使用 ${percent}%`}>
+          <svg viewBox="0 0 88 88" aria-label={`最近消息保留窗口 ${runtimeMessages.length} / 30`}>
             <circle className="meter-track" cx="44" cy="44" r="36" />
             <circle className="meter-value" cx="44" cy="44" r="36" pathLength="100" strokeDasharray={`${percent} 100`} />
           </svg>
@@ -1380,7 +1405,7 @@ export function AgentPanel({ agents, onAdd, orchestrated = false }: { agents: Ag
       </div>
 
       {orchestrated ? (
-        <div className="agent-runtime-note"><Network size={14} /><span>主智能体可串行委派最多 4 个受限子任务；每个模型调用与工具步骤都会进入 Trace</span></div>
+        <div className="agent-runtime-note"><Network size={14} /><span>主智能体可串行委派最多 4 个子任务；scout/reviewer 只读，worker 可写入；每一步都会进入 Trace</span></div>
       ) : adding ? (
         <form className="inspector-form" onSubmit={submit}>
           <div className="inspector-form-head"><strong>New specialist</strong><button type="button" aria-label="取消添加智能体" onClick={() => setAdding(false)}><X size={14} /></button></div>
@@ -1661,6 +1686,9 @@ export function ProviderSettings({
                 const validationError = providerTestError(provider)
                 const rowTesting = testing === provider.id
                 const guidanceId = `provider-guidance-${provider.id}`
+                const protocolDetail = ['cc-switch-responses', 'openai-responses'].includes(provider.adapter)
+                  ? 'Coding agent: file, Git, command, and delegated-agent tools are available'
+                  : 'Chat only: this protocol cannot read, edit, or test workspace files'
                 return <section className="provider-row" key={provider.id} aria-busy={rowTesting}>
                   <div className="provider-title">
                     <div className="provider-glyph">{provider.name.slice(0, 1)}</div>
@@ -1674,7 +1702,8 @@ export function ProviderSettings({
                   {validationError ? <p className="provider-detail is-guidance" id={guidanceId}>{validationError}</p> : null}
                   {provider.id.startsWith('custom-') ? <label><span>Name</span><input disabled={rowTesting} value={provider.name} onChange={(event) => updateProvider(provider.id, { name: event.target.value })} /></label> : null}
                   <label><span>Endpoint</span><input aria-describedby={validationError ? guidanceId : undefined} disabled={rowTesting} value={provider.endpoint} placeholder="https://provider.example/v1" onChange={(event) => updateProvider(provider.id, { endpoint: event.target.value, connected: false, latency: 0, detail: undefined, availableModels: [] })} /></label>
-                  {provider.adapter !== 'cc-switch-responses' ? <label><span>Protocol</span><select disabled={rowTesting} value={provider.adapter} onChange={(event) => updateProvider(provider.id, { adapter: event.target.value as Provider['adapter'], connected: false, latency: 0, detail: undefined, availableModels: [] })}><option value="openai-responses">Responses API + tools</option><option value="openai-chat">OpenAI-compatible chat</option><option value="anthropic">Anthropic Messages</option><option value="google">Google native</option></select></label> : null}
+                  {provider.adapter !== 'cc-switch-responses' ? <label><span>Protocol</span><select disabled={rowTesting} value={provider.adapter} onChange={(event) => updateProvider(provider.id, { adapter: event.target.value as Provider['adapter'], connected: false, latency: 0, detail: undefined, availableModels: [] })}><option value="openai-responses">Responses API + coding tools</option><option value="openai-chat">OpenAI-compatible chat (chat only)</option><option value="anthropic">Anthropic Messages (chat only)</option></select></label> : null}
+                  <p className="provider-mode-detail">{protocolDetail}</p>
                   <label><span>Default model</span>{modelChoices.length ? (
                     <select disabled={rowTesting} value={provider.model} onChange={(event) => updateProvider(provider.id, { model: event.target.value })}>
                       <option value="">Select a model</option>
@@ -1807,6 +1836,7 @@ export default function App() {
   const [branchBusy, setBranchBusy] = useState(false)
   const [activeRunId, setActiveRunId] = useState<string | null>(null)
   const activeRunRef = useRef<string | null>(null)
+  const cancelledRunIdsRef = useRef(new Set<string>())
   const workspacePickerPendingRef = useRef(false)
   const workspaceRequest = useRef(0)
   const fileRequest = useRef(0)
@@ -2117,7 +2147,7 @@ export default function App() {
     if (!desktop) return sessionAgents[activeSession.id] ?? initialAgents
     const root: Agent = {
       id: 'root', name: selectedProvider?.name ?? 'Traceframe', role: 'Orchestrator',
-      model: selectedProvider?.model || 'Provider default', state: runState === 'running' ? 'working' : 'queued', progress: 0,
+      model: selectedProvider?.model || 'Provider default', state: runState === 'running' ? 'working' : 'idle', progress: 0,
       task: runState === 'running' ? 'Executing the active run' : 'Ready for the next task', color: 'cyan',
     }
     return deriveRuntimeAgents(activeEvents, root)
@@ -2387,7 +2417,8 @@ export default function App() {
           const finalFile = followAgentEditsRef.current && !editorDirtyRef.current && latestTarget ? latestTarget.path : selectedFileRef.current
           await loadWorkspace(workspace.path, finalFile).catch(() => undefined)
           if (activeRunRef.current === runId) {
-            const nextPrompt = queuedPromptsRef.current.find((prompt) => prompt.sessionId === sessionId)
+            const wasCancelled = cancelledRunIdsRef.current.delete(runId)
+            const nextPrompt = wasCancelled ? undefined : queuedPromptsRef.current.find((prompt) => prompt.sessionId === sessionId)
             activeRunRef.current = null
             setActiveRunId(null)
             setRunCancelPending(false)
@@ -2416,6 +2447,13 @@ export default function App() {
     }))
     setSessions((current) => current.map((session) => session.id === sessionId ? { ...session, title: session.title === 'Untitled task' ? text.slice(0, 36) : session.title, summary: text.slice(0, 64), time: 'NOW' } : session))
     return true
+  }
+
+  const runQueuedPrompt = async (prompt: QueuedPrompt) => {
+    updateQueuedPrompts((current) => current.filter((item) => item.id !== prompt.id))
+    if (!await sendMessage(prompt.text)) {
+      updateQueuedPrompts((current) => [prompt, ...current])
+    }
   }
 
   const addAgent = (agent: Pick<Agent, 'name' | 'role' | 'model' | 'task'>) => {
@@ -2518,7 +2556,7 @@ export default function App() {
     const runId = activeRunRef.current ?? activeRunId
     if (runId) {
       if (runCancelPending) return
-      updateQueuedPrompts((current) => current.filter((prompt) => prompt.sessionId !== activeSession.id))
+      cancelledRunIdsRef.current.add(runId)
       setRunCancelPending(true)
       setAppError(null)
       const outcome = await requestRunCancellation(runId)
@@ -2526,6 +2564,7 @@ export default function App() {
       setRunCancelPending(false)
       setAppError(outcome.message)
       if (outcome.status === 'missing') {
+        cancelledRunIdsRef.current.delete(runId)
         if (activeRunRef.current === runId) activeRunRef.current = null
         setRunState('idle')
         setActiveRunId(null)
@@ -2593,6 +2632,7 @@ export default function App() {
         queuedPrompts={queuedPrompts.filter((prompt) => prompt.sessionId === activeSession.id)}
         onSend={sendMessage}
         onRemoveQueued={removeQueuedPrompt}
+        onRunQueued={runQueuedPrompt}
       />
     }
     if (component === 'code' || component === 'diff') {
