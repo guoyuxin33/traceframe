@@ -8,10 +8,10 @@ Traceframe is being built in visible, testable slices. Each milestone must keep 
 - [x] conversation, code, diff, terminal, trace, context, memory, and agent views
 - [x] native Git status, branch, and diff bridge
 - [x] runtime-neutral event contract
-- [x] CC Switch discovery and local proxy connection
+- [x] CC Switch discovery and proxy configuration import
 - [x] selectable theme, density, and workspace balance
-- [ ] workspace picker backed by the native dialog
-- [ ] replace representative Git data with the selected workspace snapshot
+- [x] workspace picker backed by the native dialog
+- [x] replace representative Git data with the selected workspace snapshot
 
 ## M2: Runtime integration
 
