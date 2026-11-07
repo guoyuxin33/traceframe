@@ -3849,6 +3849,7 @@ name = "traceframe"
 version = "0.3.0"
 dependencies = [
  "futures-util",
+ "libc",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",

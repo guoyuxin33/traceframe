@@ -19,6 +19,21 @@ export interface GitSnapshot {
   }>
 }
 
+export interface GitOperationResult {
+  snapshot: GitSnapshot | null
+  output: string
+  refreshError: string | null
+}
+
+export interface GitCommitRecord {
+  hash: string
+  shortHash: string
+  author: string
+  authoredAt: string
+  refs: string[]
+  subject: string
+}
+
 export interface WorkspaceTreeEntry {
   path: string
   name: string
@@ -110,6 +125,10 @@ function displayTime(timestamp: number) {
   return new Date(timestamp).toLocaleTimeString('zh-CN', { hour12: false })
 }
 
+function runtimeEvent({ eventType, createdAt, ...event }: StoredEvent): RuntimeEventRecord {
+  return { ...event, type: eventType as RuntimeEventType, timestamp: createdAt }
+}
+
 function providerPayload(provider: Provider) {
   return {
     id: provider.id,
@@ -145,8 +164,36 @@ export async function listGitBranches(path: string) {
   return invoke<string[]>('git_branches', { path })
 }
 
+export async function getGitHistory(path: string) {
+  return invoke<GitCommitRecord[]>('git_history', { path })
+}
+
 export async function switchGitBranch(path: string, branch: string) {
-  return invoke<GitSnapshot>('git_switch_branch', { path, branch })
+  return invoke<GitOperationResult>('git_switch_branch', { path, branch })
+}
+
+export async function createGitBranch(path: string, branch: string) {
+  return invoke<GitOperationResult>('git_create_branch', { path, branch })
+}
+
+export async function stageAllGitChanges(path: string) {
+  return invoke<GitOperationResult>('git_stage_all', { path })
+}
+
+export async function unstageAllGitChanges(path: string) {
+  return invoke<GitOperationResult>('git_unstage_all', { path })
+}
+
+export async function commitGitChanges(path: string, message: string) {
+  return invoke<GitOperationResult>('git_commit', { path, message })
+}
+
+export async function pullGitBranch(path: string) {
+  return invoke<GitOperationResult>('git_pull', { path })
+}
+
+export async function pushGitBranch(path: string) {
+  return invoke<GitOperationResult>('git_push', { path })
 }
 
 export async function getGitDiff(path: string, staged = false, relativePath?: string) {
@@ -175,8 +222,12 @@ export async function getAppSnapshot(): Promise<AppSnapshot> {
       type: (memory.kind || 'Decision') as MemoryRecord['type'],
       time: displayTime(memory.createdAt),
     })),
-    events: snapshot.events.map(({ eventType, createdAt, ...event }) => ({ ...event, type: eventType as RuntimeEventType, timestamp: createdAt })),
+    events: snapshot.events.map(runtimeEvent),
   }
+}
+
+export async function getSessionRuntimeEvents(sessionId: string) {
+  return (await invoke<StoredEvent[]>('session_events', { sessionId })).map(runtimeEvent)
 }
 
 export async function createNativeSession(title: string, branch: string, workspacePath: string) {

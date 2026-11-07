@@ -4,20 +4,28 @@ import { describe, expect, it, vi } from 'vitest'
 import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import {
+  AppRail,
   AgentPanel,
   CodeView,
   ContextPanel,
   ConversationPanel,
+  DiffView,
   FileTree,
+  GitPanel,
+  MarkdownBody,
   MemoryPanel,
   ProviderSettings,
   RepositoryDock,
+  TerminalView,
   SessionsPanel,
   TopBar,
   activeSessionIdAfterArchive,
   agentEditTarget,
+  currentExecutionSummary,
+  executionSteps,
   firstActiveSessionId,
   isRetiredOpenAiModel,
+  mergeSnapshotEvents,
   providerTestError,
   requestRunCancellation,
   requestWorkspaceSelection,
@@ -27,6 +35,7 @@ import {
   validateWorkspaceCandidate,
 } from './App'
 import type { Provider, Session } from './types'
+import type { RuntimeEventRecord } from './types'
 
 const sessions: Session[] = [
   { id: 'archived', title: 'Archived', summary: '', time: '', branch: 'main', archived: true },
@@ -54,6 +63,10 @@ const workspace = {
 }
 
 const activeSession: Session = { id: 'first', title: 'First', summary: 'Active work', time: 'NOW', branch: 'main' }
+
+function runtimeEvent(sequence: number, type: RuntimeEventRecord['type'], payload: Record<string, unknown> = {}): RuntimeEventRecord {
+  return { id: `event-${sequence}`, sessionId: 'first', runId: 'run-1', sequence, type, payload, timestamp: 1_700_000_000_000 + sequence }
+}
 
 describe('session interaction state', () => {
   it('chooses the explicit active preview session and moves away after archiving it', () => {
@@ -236,6 +249,273 @@ describe('conversation controls', () => {
   })
 })
 
+describe('model response presentation', () => {
+  it('renders GFM without mounting raw HTML', () => {
+    const { container } = render(<MarkdownBody body={'# Result\n\n- one\n- two\n\n```ts\nconst value = 1\n```\n\n| File | State |\n| --- | --- |\n| App.tsx | changed |\n\n<script>alert(1)</script>'} />)
+
+    expect(screen.getByRole('heading', { name: 'Result' })).toBeVisible()
+    expect(screen.getByText('const value = 1')).toBeVisible()
+    expect(screen.getByRole('table')).toBeVisible()
+    expect(container.querySelector('script')).toBeNull()
+  })
+
+  it('shows streaming agent content as Markdown', () => {
+    render(<ConversationPanel
+      session={activeSession}
+      messages={[]}
+      liveMessage={{ id: 'live-run-1', author: 'Agent', role: 'agent', time: 'now', body: '**working**' }}
+      agents={[]}
+      disabled={false}
+      onSend={vi.fn().mockResolvedValue(true)}
+    />)
+
+    expect(screen.getByText('working').tagName).toBe('STRONG')
+  })
+})
+
+describe('execution evidence', () => {
+  const events = [
+    runtimeEvent(1, 'run.created', { provider: 'CC Switch', model: 'gpt-current' }),
+    runtimeEvent(2, 'model.requested', { model: 'gpt-current', round: 1 }),
+    runtimeEvent(3, 'tool.started', { item: { callId: 'call-1', name: 'run_command', arguments: '{"program":"npm","args":["test"]}' } }),
+    runtimeEvent(4, 'file.changed', { callId: 'call-1', path: 'src/App.tsx', startLine: 10, endLine: 12 }),
+    runtimeEvent(5, 'tool.completed', { item: { callId: 'call-1', name: 'run_command' }, durationMs: 45, output: '39 tests passed' }),
+    runtimeEvent(6, 'model.completed', { model: 'gpt-current', round: 1, durationMs: 80 }),
+    runtimeEvent(7, 'agent.started', { agentId: 'reviewer', name: 'Reviewer', task: 'Inspect the patch' }),
+    runtimeEvent(8, 'agent.completed', { agentId: 'reviewer', name: 'Reviewer', status: 'completed', result: 'No blocking findings' }),
+    runtimeEvent(9, 'run.completed', { rounds: 1 }),
+  ] satisfies RuntimeEventRecord[]
+
+  it('pairs tool, model, file, and agent lifecycle records', () => {
+    const steps = executionSteps(events)
+    const tool = steps.find((step) => step.id === 'call-1')
+    const agent = steps.filter((step) => step.id === 'agent:reviewer')
+
+    expect(tool).toMatchObject({ status: 'completed', output: '39 tests passed', durationMs: 45 })
+    expect(tool?.files).toEqual([{ path: 'src/App.tsx', startLine: 10, endLine: 12 }])
+    expect(agent).toHaveLength(1)
+    expect(agent[0]).toMatchObject({ status: 'completed', summary: 'No blocking findings' })
+  })
+
+  it('describes the active command instead of a generic running label', () => {
+    expect(currentExecutionSummary(events.slice(0, 3), 'run-1')).toBe('Run command · npm test')
+  })
+
+  it('renders collapsible arguments, results, and clickable file evidence in Conversation', async () => {
+    const user = userEvent.setup()
+    const onOpenExecutionFile = vi.fn()
+    render(<ConversationPanel
+      session={activeSession}
+      messages={[]}
+      agents={[]}
+      disabled={false}
+      events={events}
+      onOpenExecutionFile={onOpenExecutionFile}
+      onSend={vi.fn().mockResolvedValue(true)}
+    />)
+
+    const command = screen.getByRole('group', { name: /Run command: npm test/ })
+    await user.click(command.querySelector('summary') as HTMLElement)
+    expect(screen.getByText('39 tests passed')).toBeVisible()
+    await user.click(screen.getByRole('button', { name: /src\/App\.tsx/ }))
+    expect(onOpenExecutionFile).toHaveBeenCalledWith('src/App.tsx')
+  })
+
+  it('auto-collapses a completed step unless the user changed its disclosure', async () => {
+    const baseProps = { session: activeSession, messages: [], agents: [], disabled: false, onSend: vi.fn().mockResolvedValue(true) }
+    const { rerender } = render(<ConversationPanel {...baseProps} events={events.slice(0, 3)} />)
+    const command = screen.getByRole('group', { name: /Run command: npm test/ })
+    expect(command).toHaveAttribute('open')
+
+    rerender(<ConversationPanel {...baseProps} events={events.slice(0, 6)} />)
+    await waitFor(() => expect(command).not.toHaveAttribute('open'))
+  })
+
+  it('keeps active tools active when an earlier run in the session completed', () => {
+    const oldRun = [
+      { ...runtimeEvent(1, 'run.created'), runId: 'run-old' },
+      { ...runtimeEvent(2, 'tool.started', { item: { callId: 'old-tool', name: 'run_command', arguments: '{"program":"npm","args":["run","old"]}' } }), runId: 'run-old' },
+      { ...runtimeEvent(3, 'tool.completed', { item: { callId: 'old-tool', name: 'run_command' } }), runId: 'run-old' },
+      { ...runtimeEvent(4, 'run.completed'), runId: 'run-old' },
+    ] satisfies RuntimeEventRecord[]
+    const activeRun = [
+      { ...runtimeEvent(1, 'run.created'), runId: 'run-new', timestamp: 1_800_000_000_001 },
+      { ...runtimeEvent(2, 'tool.started', { item: { callId: 'new-tool', name: 'run_command', arguments: '{"program":"npm","args":["run","new"]}' } }), runId: 'run-new', timestamp: 1_800_000_000_002 },
+    ] satisfies RuntimeEventRecord[]
+
+    render(<TerminalView runState="running" workspace={workspace} branch="main" events={[...oldRun, ...activeRun]} />)
+    expect(screen.getByText(/npm run new/).closest('div')).toHaveClass('terminal-active')
+    expect(screen.getByText(/npm run old/).closest('div')).toHaveClass('terminal-muted')
+  })
+
+  it('preserves live model deltas across a snapshot reload only while the run is active', () => {
+    const delta = runtimeEvent(3, 'model.delta', { delta: 'partial reply' })
+    const snapshot = [runtimeEvent(1, 'run.created')]
+
+    expect(mergeSnapshotEvents(snapshot, [delta], 'first', true)).toContainEqual(delta)
+    expect(mergeSnapshotEvents(snapshot, [delta], 'first', false)).not.toContainEqual(delta)
+  })
+})
+
+describe('source control panel', () => {
+  const gitWorkspace = {
+    ...workspace,
+    branches: ['main', 'review'],
+    snapshot: {
+      branch: 'main', ahead: 1, behind: 0,
+      files: [
+        { path: 'src/staged.ts', indexStatus: 'M', worktreeStatus: ' ' },
+        { path: 'src/new.ts', indexStatus: '?', worktreeStatus: '?' },
+      ],
+    },
+  }
+
+  const gitProps = () => ({
+    workspace: gitWorkspace,
+    history: [{
+      hash: '4e8798f9e0c5bdaf9e6b467d218389c0d07b4576',
+      shortHash: '4e8798f',
+      author: 'Traceframe Test',
+      authoredAt: '2026-11-07T15:26:33+08:00',
+      refs: ['HEAD -> main', 'origin/main'],
+      subject: 'fix: recover interrupted agent runs',
+    }],
+    historyLoading: false,
+    historyError: null,
+    busy: false,
+    operation: null,
+    error: null,
+    output: '',
+    disabled: false,
+    onRefresh: vi.fn().mockResolvedValue(true),
+    onSwitchBranch: vi.fn().mockResolvedValue(true),
+    onCreateBranch: vi.fn().mockResolvedValue(true),
+    onStageAll: vi.fn().mockResolvedValue(true),
+    onUnstageAll: vi.fn().mockResolvedValue(true),
+    onCommit: vi.fn().mockResolvedValue(true),
+    onPull: vi.fn().mockResolvedValue(true),
+    onPush: vi.fn().mockResolvedValue(true),
+    onOpenFile: vi.fn(),
+  })
+
+  it('wires branch, stage, commit, sync, refresh, and file controls', async () => {
+    const user = userEvent.setup()
+    const props = gitProps()
+    render(<GitPanel {...props} />)
+
+    await user.click(screen.getByText('Branches & remote'))
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Switch branch' }), 'review')
+    await user.type(screen.getByRole('textbox', { name: 'New branch name' }), 'feature/source')
+    await user.click(screen.getByRole('button', { name: /Create/ }))
+    await user.click(screen.getByRole('button', { name: /Stage all/ }))
+    await user.click(screen.getByRole('button', { name: /Unstage all/ }))
+    await user.type(screen.getByRole('textbox', { name: 'Commit message' }), 'feat: source controls')
+    await user.click(screen.getByRole('button', { name: /Commit 1/ }))
+    await user.click(screen.getByRole('button', { name: /Pull/ }))
+    await user.click(screen.getByRole('button', { name: /Push/ }))
+    await user.click(screen.getByRole('button', { name: 'Refresh Git status' }))
+    await user.click(screen.getByRole('button', { name: /src\/new\.ts/ }))
+
+    expect(props.onSwitchBranch).toHaveBeenCalledWith('review')
+    expect(props.onCreateBranch).toHaveBeenCalledWith('feature/source')
+    expect(props.onStageAll).toHaveBeenCalledTimes(1)
+    expect(props.onUnstageAll).toHaveBeenCalledTimes(1)
+    expect(props.onCommit).toHaveBeenCalledWith('feat: source controls')
+    expect(props.onPull).toHaveBeenCalledTimes(1)
+    expect(props.onPush).toHaveBeenCalledTimes(1)
+    expect(props.onRefresh).toHaveBeenCalledTimes(1)
+    expect(props.onOpenFile).toHaveBeenCalledWith('src/new.ts')
+  })
+
+  it('opens source control from the activity rail and exposes the change count', async () => {
+    const user = userEvent.setup()
+    const onShowDock = vi.fn()
+    render(<AppRail changeCount={16} active="source" onShowSessions={vi.fn()} onShowDock={onShowDock} />)
+
+    await user.click(screen.getByRole('button', { name: '源代码管理，16 个更改' }))
+
+    expect(onShowDock).toHaveBeenCalledWith('source')
+    expect(screen.getByText('16')).toBeVisible()
+    expect(screen.getByRole('button', { name: '源代码管理，16 个更改' })).toHaveClass('is-active')
+    expect(screen.getByRole('button', { name: '源代码管理，16 个更改' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: '会话' })).not.toHaveClass('is-active')
+    expect(screen.getByRole('button', { name: '会话' })).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  it('keeps changes, history, and branch controls in independent disclosures', () => {
+    render(<GitPanel {...gitProps()} />)
+
+    expect(screen.getByText('Changes').closest('details')).toHaveAttribute('open')
+    expect(screen.getByText('History').closest('details')).not.toHaveAttribute('open')
+    expect(screen.getByText('Branches & remote').closest('details')).not.toHaveAttribute('open')
+  })
+
+  it('shows expandable commit history with identity, refs, and timestamp', async () => {
+    const user = userEvent.setup()
+    render(<GitPanel {...gitProps()} />)
+
+    await user.click(screen.getByText('History'))
+    const commit = screen.getByText('fix: recover interrupted agent runs').closest('details')
+    expect(commit).not.toHaveAttribute('open')
+    await user.click(screen.getByText('fix: recover interrupted agent runs'))
+
+    expect(commit).toHaveAttribute('open')
+    expect(screen.getByText('Traceframe Test')).toBeVisible()
+    expect(screen.getByText('origin/main')).toBeVisible()
+    expect(screen.getByText('4e8798f9e0c5bdaf9e6b467d218389c0d07b4576')).toBeVisible()
+  })
+
+  it('locks every mutating Git control while an agent run owns the workspace', async () => {
+    const user = userEvent.setup()
+    render(<GitPanel {...gitProps()} disabled />)
+    await user.click(screen.getByText('Branches & remote'))
+    expect(screen.getByRole('combobox', { name: 'Switch branch' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /Stage all/ })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /Commit 1/ })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /Push/ })).toBeDisabled()
+  })
+
+  it('shows a partially staged file in both source groups', () => {
+    const mixedWorkspace = {
+      ...gitWorkspace,
+      snapshot: { ...gitWorkspace.snapshot, files: [{ path: 'src/mixed.ts', indexStatus: 'M', worktreeStatus: 'M' }] },
+    }
+    render(<GitPanel {...gitProps()} workspace={mixedWorkspace} />)
+
+    expect(screen.getByText('Staged')).toBeVisible()
+    expect(screen.getByText('Working tree')).toBeVisible()
+    expect(screen.getAllByRole('button', { name: /src\/mixed\.ts/ })).toHaveLength(2)
+  })
+
+  it('clears commit and branch drafts when the repository changes', async () => {
+    const user = userEvent.setup()
+    const { rerender } = render(<GitPanel {...gitProps()} />)
+    await user.type(screen.getByRole('textbox', { name: 'Commit message' }), 'repo A commit')
+    await user.type(screen.getByRole('textbox', { name: 'New branch name' }), 'repo-a-branch')
+
+    rerender(<GitPanel {...gitProps()} workspace={{ ...gitWorkspace, path: '/tmp/other-repo', name: 'other-repo' }} />)
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Commit message' })).toHaveValue(''))
+    expect(screen.getByRole('textbox', { name: 'New branch name' })).toHaveValue('')
+  })
+
+  it('separates staged and working-tree patches', async () => {
+    const user = userEvent.setup()
+    render(<DiffView
+      path="src/mixed.ts"
+      stagedDiff={'diff --git a/src/mixed.ts b/src/mixed.ts\n@@ -1 +1 @@\n-old staged\n+new staged'}
+      workingDiff={'diff --git a/src/mixed.ts b/src/mixed.ts\n@@ -2 +2 @@\n-old working\n+new working'}
+      loading={false}
+      error={null}
+    />)
+
+    expect(screen.getByText('src/mixed.ts · working tree')).toBeVisible()
+    expect(screen.getByText('new working')).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Staged' }))
+    expect(screen.getByText('src/mixed.ts · staged for commit')).toBeVisible()
+    expect(screen.getByText('new staged')).toBeVisible()
+  })
+})
+
 describe('run cancellation', () => {
   it('turns a missing native run into an explicit outcome', async () => {
     await expect(requestRunCancellation('run-1', vi.fn().mockResolvedValue(false))).resolves.toEqual({
@@ -398,7 +678,8 @@ describe('repository interaction lock', () => {
       workspace={workspace}
       selectedFile=""
       file={null}
-      diff=""
+      stagedDiff=""
+      workingDiff=""
       loading={false}
       fileLoading={false}
       error="Workspace unavailable"
@@ -435,7 +716,8 @@ describe('repository interaction lock', () => {
       workspace={workspace}
       selectedFile=""
       file={null}
-      diff=""
+      stagedDiff=""
+      workingDiff=""
       loading={false}
       fileLoading={false}
       error={null}

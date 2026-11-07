@@ -1,11 +1,17 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Actions, Layout, Model, type IJsonModel, type TabNode } from 'flexlayout-react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import 'flexlayout-react/style/dark.css'
 import {
   Activity,
   Archive,
   Bot,
   Boxes,
+  CheckCircle2,
+  CircleX,
+  Clock,
+  Command,
   GitBranch,
   Check,
   ChevronDown,
@@ -14,15 +20,19 @@ import {
   Cpu,
   Crosshair,
   Database,
+  Download,
   File,
   FileCode2,
+  FilePenLine,
   FolderOpen,
   GitCompareArrows,
+  GitCommitHorizontal,
   GitFork,
   HardDrive,
   KeyRound,
   Layers3,
   ListTree,
+  LoaderCircle,
   MemoryStick,
   MessageSquare,
   Network,
@@ -38,6 +48,7 @@ import {
   ShieldCheck,
   SquareTerminal,
   TestTube2,
+  Upload,
   X,
   Zap,
 } from 'lucide-react'
@@ -56,28 +67,37 @@ import {
   appendNativeMessage,
   archiveNativeSession,
   cancelNativeRun,
+  commitGitChanges,
   compactNativeSession,
+  createGitBranch,
   createNativeSession,
   deleteNativeMemory,
   getAppSnapshot,
   getGitDiff,
+  getGitHistory,
   getGitSnapshot,
   getNativeCapabilities,
   getRecentWorkspace,
+  getSessionRuntimeEvents,
   getWorkspaceTree,
   isDesktopRuntime,
   listGitBranches,
   pickWorkspace,
+  pullGitBranch,
+  pushGitBranch,
   readWorkspaceFile,
   saveNativeMemory,
   startNativeRun,
+  stageAllGitChanges,
   steerNativeRun,
   switchGitBranch,
   testNativeProvider,
   updateNativeMemory,
   updateNativeSessionScope,
+  unstageAllGitChanges,
   writeWorkspaceFile,
   type GitSnapshot,
+  type GitCommitRecord,
   type NativeCapabilities,
   type WorkspaceFile,
   type WorkspaceTreeEntry,
@@ -106,6 +126,33 @@ export interface QueuedPrompt {
 
 export type ComposerSendMode = 'run' | 'steer' | 'queue'
 
+const MAX_RENDERER_EVENTS = 6_000
+
+function replaceSessionEvents(current: RuntimeEventRecord[], sessionId: string, events: RuntimeEventRecord[]) {
+  return [...events, ...current.filter((event) => event.sessionId !== sessionId)].slice(0, MAX_RENDERER_EVENTS)
+}
+
+export function mergeSnapshotEvents(
+  snapshot: RuntimeEventRecord[],
+  current: RuntimeEventRecord[],
+  activeSessionId: string,
+  runActive: boolean,
+) {
+  if (!activeSessionId) return snapshot
+  const snapshotActive = snapshot.filter((event) => event.sessionId === activeSessionId)
+  const known = new Set(snapshotActive.map((event) => event.id))
+  const preservedActive = current.filter((event) => (
+    event.sessionId === activeSessionId
+    && !known.has(event.id)
+    && (runActive || event.type !== 'model.delta')
+  ))
+  return replaceSessionEvents(
+    snapshot.filter((event) => event.sessionId !== activeSessionId),
+    activeSessionId,
+    [...snapshotActive, ...preservedActive].slice(0, 1_000),
+  )
+}
+
 export function agentEditTarget(event: RuntimeEventRecord): AgentEditTarget | null {
   if (event.type !== 'file.changed') return null
   const path = typeof event.payload.path === 'string' ? event.payload.path : ''
@@ -131,8 +178,20 @@ const defaultUiPreferences: UiPreferences = {
 }
 
 const DOCK_LAYOUT_STORAGE_KEY = 'traceframe.dock-layout.v3'
-const DOCK_COMPONENTS = ['sessions', 'conversation', 'code', 'diff', 'output', 'trace', 'context', 'agents', 'memory'] as const
+const DOCK_COMPONENTS = ['sessions', 'source', 'conversation', 'code', 'diff', 'output', 'trace', 'context', 'agents', 'memory'] as const
 type DockComponent = typeof DOCK_COMPONENTS[number]
+type RailComponent = Extract<DockComponent, 'sessions' | 'source' | 'agents' | 'memory'>
+
+function selectedRailComponent(model: Model, includeSelectedFallback = false): RailComponent | null {
+  const component = model.getActiveTabset()?.getSelectedNode()?.getComponent()
+  if (component === 'sessions' || component === 'source' || component === 'agents' || component === 'memory') return component
+  if (includeSelectedFallback) {
+    const selected = (['source', 'sessions', 'agents', 'memory'] as const)
+      .find((candidate) => (model.getNodeById(candidate) as TabNode | undefined)?.isSelected())
+    if (selected) return selected
+  }
+  return null
+}
 
 function dockTab(id: DockComponent, name: string) {
   return { type: 'tab' as const, id, name, component: id }
@@ -152,7 +211,7 @@ function dockLayoutJson(preset: UiPreferences['layout']): IJsonModel {
       type: 'row',
       weight: 100,
       children: [
-        { type: 'tabset', weight: weights[0], minWidth: 200, children: [dockTab('sessions', 'Sessions')] },
+        { type: 'tabset', weight: weights[0], minWidth: 200, children: [dockTab('sessions', 'Sessions'), dockTab('source', 'Source')] },
         { type: 'tabset', weight: weights[1], minWidth: 220, children: [dockTab('conversation', 'Conversation')] },
         {
           type: 'row',
@@ -326,6 +385,7 @@ const IconButton = ({
     type="button"
     aria-label={label}
     title={label}
+    aria-pressed={active === undefined ? undefined : active}
     disabled={disabled}
     onClick={onClick}
   >
@@ -427,13 +487,27 @@ export function TopBar({
   )
 }
 
-function AppRail({ onShowSessions, onShowDock }: { onShowSessions: () => void; onShowDock: (component: DockComponent) => void }) {
+export function AppRail({
+  changeCount,
+  active,
+  onShowSessions,
+  onShowDock,
+}: {
+  changeCount: number
+  active?: RailComponent | null
+  onShowSessions: () => void
+  onShowDock: (component: DockComponent) => void
+}) {
   return (
     <nav className="app-rail" aria-label="主导航">
       <div className="rail-primary">
-        <IconButton label="会话" onClick={onShowSessions}><MessageSquare size={18} /></IconButton>
-        <IconButton label="智能体拓扑" onClick={() => onShowDock('agents')}><Network size={18} /></IconButton>
-        <IconButton label="记忆库" onClick={() => onShowDock('memory')}><Database size={18} /></IconButton>
+        <IconButton label="会话" active={active === 'sessions'} onClick={onShowSessions}><MessageSquare size={18} /></IconButton>
+        <div className="rail-control">
+          <IconButton label={`源代码管理${changeCount ? `，${changeCount} 个更改` : ''}`} active={active === 'source'} onClick={() => onShowDock('source')}><GitCompareArrows size={18} /></IconButton>
+          {changeCount ? <span aria-hidden="true">{changeCount > 99 ? '99+' : changeCount}</span> : null}
+        </div>
+        <IconButton label="智能体拓扑" active={active === 'agents'} onClick={() => onShowDock('agents')}><Network size={18} /></IconButton>
+        <IconButton label="记忆库" active={active === 'memory'} onClick={() => onShowDock('memory')}><Database size={18} /></IconButton>
       </div>
       <div className="rail-secondary">
         <div className="user-avatar" aria-label="当前用户">GX</div>
@@ -562,7 +636,9 @@ function MessageCard({ message }: { message: Message }) {
           <span className="message-author">{message.author}</span>
           <time>{message.time}</time>
         </header>
-        <p>{message.body}</p>
+        {message.role === 'agent'
+          ? <MarkdownBody body={message.body} />
+          : <p className="message-plain">{message.body}</p>}
         {message.steps ? (
           <ol className="message-steps">
             {message.steps.map((step, index) => (
@@ -580,6 +656,308 @@ function MessageCard({ message }: { message: Message }) {
   )
 }
 
+export function MarkdownBody({ body }: { body: string }) {
+  return (
+    <div className="markdown-body">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ node, ...props }) => {
+            void node
+            return <a {...props} target="_blank" rel="noreferrer" />
+          },
+        }}
+      >{body}</ReactMarkdown>
+    </div>
+  )
+}
+
+type ExecutionStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'info'
+
+export interface ExecutionFileChange {
+  path: string
+  startLine: number
+  endLine: number
+}
+
+export interface ExecutionStep {
+  id: string
+  sequence: number
+  kind: 'run' | 'model' | 'tool' | 'file' | 'agent' | 'guidance' | 'context'
+  title: string
+  summary: string
+  status: ExecutionStatus
+  timestamp: number
+  durationMs?: number
+  arguments?: Record<string, unknown>
+  details?: Record<string, unknown>
+  output?: string
+  files: ExecutionFileChange[]
+}
+
+function parsedArguments(value: unknown) {
+  const direct = recordValue(value)
+  if (direct) return direct
+  if (typeof value !== 'string' || !value.trim()) return undefined
+  try {
+    return recordValue(JSON.parse(value))
+  } catch {
+    return { raw: value }
+  }
+}
+
+function displayArgument(value: unknown) {
+  if (typeof value !== 'string') return String(value ?? '')
+  return /^[A-Za-z0-9_./:@%+=,-]+$/.test(value) ? value : JSON.stringify(value)
+}
+
+function toolTitle(name: string) {
+  const names: Record<string, string> = {
+    list_files: 'List files', read_file: 'Read file', edit_file: 'Edit file', create_file: 'Create file',
+    git_status: 'Inspect Git status', git_diff: 'Inspect Git diff', run_command: 'Run command', delegate_task: 'Delegate task',
+  }
+  return names[name] ?? name.replaceAll('_', ' ')
+}
+
+function toolSummary(name: string, args?: Record<string, unknown>) {
+  if (!args) return toolTitle(name)
+  if (name === 'run_command') {
+    const program = firstString(args.program)
+    const commandArgs = Array.isArray(args.args) ? args.args.map(displayArgument) : []
+    return [program, ...commandArgs].filter(Boolean).join(' ') || 'Command arguments unavailable'
+  }
+  if (name === 'delegate_task') return firstString(args.task, args.name) ?? 'Delegated task'
+  return firstString(args.path, args.relative_path, args.query, args.workdir) ?? toolTitle(name)
+}
+
+function eventAgentId(event: RuntimeEventRecord) {
+  return firstString(event.payload.agentId, event.payload.agent_id) ?? 'root'
+}
+
+export function executionSteps(events: RuntimeEventRecord[]) {
+  const steps: ExecutionStep[] = []
+  const tools = new Map<string, ExecutionStep>()
+  const models = new Map<string, ExecutionStep>()
+  const agents = new Map<string, ExecutionStep>()
+  const ordered = [...events].sort((left, right) => left.sequence - right.sequence || left.timestamp - right.timestamp)
+
+  ordered.forEach((event) => {
+    const item = eventItem(event)
+    if (event.type === 'model.delta') return
+    if (event.type === 'tool.started') {
+      const callId = firstString(item?.callId, item?.call_id) ?? event.id
+      const name = firstString(item?.name) ?? 'tool'
+      const args = parsedArguments(item?.arguments)
+      const step: ExecutionStep = {
+        id: callId, sequence: event.sequence, kind: 'tool', title: toolTitle(name), summary: toolSummary(name, args),
+        status: 'running', timestamp: event.timestamp, arguments: args, files: [],
+      }
+      tools.set(callId, step)
+      steps.push(step)
+      return
+    }
+    if (event.type === 'tool.completed' || event.type === 'tool.failed') {
+      const callId = firstString(item?.callId, item?.call_id) ?? event.id
+      const name = firstString(item?.name) ?? 'tool'
+      const step = tools.get(callId) ?? {
+        id: callId, sequence: event.sequence, kind: 'tool' as const, title: toolTitle(name), summary: toolTitle(name),
+        status: 'running' as const, timestamp: event.timestamp, files: [],
+      }
+      step.status = event.type === 'tool.failed' ? 'failed' : 'completed'
+      step.durationMs = typeof event.payload.durationMs === 'number' ? event.payload.durationMs : undefined
+      step.output = firstString(event.payload.output, item?.output)
+      if (!tools.has(callId)) steps.push(step)
+      tools.set(callId, step)
+      return
+    }
+    if (event.type === 'file.changed') {
+      const path = firstString(event.payload.path) ?? 'Unknown file'
+      const change = {
+        path,
+        startLine: typeof event.payload.startLine === 'number' ? event.payload.startLine : 1,
+        endLine: typeof event.payload.endLine === 'number' ? event.payload.endLine : typeof event.payload.startLine === 'number' ? event.payload.startLine : 1,
+      }
+      const callId = firstString(event.payload.callId, event.payload.call_id)
+      const owner = callId ? tools.get(callId) : [...tools.values()].reverse().find((step) => step.status === 'running')
+      if (owner) owner.files.push(change)
+      else steps.push({
+        id: event.id, sequence: event.sequence, kind: 'file', title: 'File changed', summary: path,
+        status: 'completed', timestamp: event.timestamp, files: [change],
+      })
+      return
+    }
+    if (event.type === 'model.requested') {
+      const round = typeof event.payload.round === 'number' ? event.payload.round : 1
+      const key = `${eventAgentId(event)}:${round}`
+      const step: ExecutionStep = {
+        id: event.id, sequence: event.sequence, kind: 'model', title: `Model turn ${round}`,
+        summary: firstString(event.payload.model) ?? 'Provider model', status: 'running', timestamp: event.timestamp,
+        details: {
+          endpoint: event.payload.endpoint,
+          model: event.payload.model,
+          toolRound: event.payload.toolRound,
+          toolsEnabled: event.payload.toolsEnabled,
+          agentId: eventAgentId(event),
+        },
+        files: [],
+      }
+      models.set(key, step)
+      steps.push(step)
+      return
+    }
+    if (event.type === 'model.completed') {
+      const round = typeof event.payload.round === 'number' ? event.payload.round : 1
+      const key = `${eventAgentId(event)}:${round}`
+      const step = models.get(key) ?? {
+        id: event.id, sequence: event.sequence, kind: 'model' as const, title: `Model turn ${round}`,
+        summary: 'Provider model', status: 'running' as const, timestamp: event.timestamp, files: [],
+      }
+      step.status = 'completed'
+      step.durationMs = typeof event.payload.durationMs === 'number' ? event.payload.durationMs : undefined
+      step.details = { ...step.details, ...event.payload }
+      if (!models.has(key)) steps.push(step)
+      models.set(key, step)
+      return
+    }
+
+    const common = { id: event.id, sequence: event.sequence, timestamp: event.timestamp, files: [] as ExecutionFileChange[] }
+    if (event.type === 'run.created') steps.push({
+      ...common, kind: 'run', title: 'Run started',
+      summary: [firstString(event.payload.provider), firstString(event.payload.model)].filter(Boolean).join(' · '),
+      status: 'completed', details: event.payload,
+    })
+    else if (event.type === 'run.completed') steps.push({ ...common, kind: 'run', title: 'Run completed', summary: `${String(event.payload.rounds ?? '')} model turns`.trim(), status: 'completed', details: event.payload })
+    else if (event.type === 'run.failed') steps.push({ ...common, kind: 'run', title: 'Run failed', summary: firstString(event.payload.error, event.payload.reason) ?? 'Runtime failure', status: 'failed', details: event.payload })
+    else if (event.type === 'run.cancelled') steps.push({ ...common, kind: 'run', title: 'Run cancelled', summary: firstString(event.payload.reason) ?? 'Cancelled', status: 'cancelled', details: event.payload })
+    else if (event.type === 'run.steered') steps.push({ ...common, kind: 'guidance', title: 'Guidance applied', summary: `${String(event.payload.count ?? 1)} instruction`, status: 'completed', details: event.payload })
+    else if (event.type === 'agent.started') {
+      const agentId = eventAgentId(event)
+      const step = { ...common, id: `agent:${agentId}`, kind: 'agent' as const, title: `Agent · ${firstString(event.payload.name) ?? agentId}`, summary: firstString(event.payload.task) ?? 'Delegated task', status: 'running' as const, details: event.payload }
+      agents.set(agentId, step)
+      steps.push(step)
+    }
+    else if (event.type === 'agent.completed') {
+      const agentId = eventAgentId(event)
+      const step = agents.get(agentId) ?? { ...common, id: `agent:${agentId}`, kind: 'agent' as const, title: `Agent · ${firstString(event.payload.name) ?? agentId}`, summary: 'Delegated task', status: 'running' as const }
+      step.status = runtimeAgentState(event.payload.status, event.type) === 'failed' ? 'failed' : runtimeAgentState(event.payload.status, event.type) === 'cancelled' ? 'cancelled' : 'completed'
+      step.summary = firstString(event.payload.error, event.payload.result, event.payload.task) ?? 'Delegated task finished'
+      step.details = { ...step.details, ...event.payload }
+      if (!agents.has(agentId)) steps.push(step)
+      agents.set(agentId, step)
+    }
+    else if (event.type === 'context.compacted') steps.push({ ...common, kind: 'context', title: 'Context compacted', summary: `${String(event.payload.messageCount ?? 0)} messages`, status: 'completed', details: event.payload })
+  })
+  const terminal = [...ordered].reverse().find((event) => ['run.completed', 'run.failed', 'run.cancelled'].includes(event.type))
+  if (terminal) {
+    const finalStatus: ExecutionStatus = terminal.type === 'run.failed' ? 'failed' : terminal.type === 'run.cancelled' ? 'cancelled' : 'completed'
+    steps.forEach((step) => {
+      if (step.status === 'running') step.status = finalStatus
+    })
+  }
+  return steps.sort((left, right) => left.sequence - right.sequence)
+}
+
+function executionStatus(events: RuntimeEventRecord[]) {
+  const terminal = [...events]
+    .sort((left, right) => right.sequence - left.sequence)
+    .find((event) => ['run.completed', 'run.failed', 'run.cancelled'].includes(event.type))
+  if (terminal?.type === 'run.failed') return 'failed' as const
+  if (terminal?.type === 'run.cancelled') return 'cancelled' as const
+  if (terminal?.type === 'run.completed') return 'completed' as const
+  return 'running' as const
+}
+
+function formatDuration(durationMs?: number) {
+  if (durationMs === undefined) return ''
+  return durationMs < 1_000 ? `${durationMs} ms` : `${(durationMs / 1_000).toFixed(1)} s`
+}
+
+function ExecutionStatusIcon({ status }: { status: ExecutionStatus }) {
+  if (status === 'running') return <LoaderCircle className="is-spinning" size={14} />
+  if (status === 'failed') return <CircleX size={14} />
+  if (status === 'cancelled') return <Clock size={14} />
+  return <CheckCircle2 size={14} />
+}
+
+function ExecutionStepDisclosure({ step, onOpenFile }: { step: ExecutionStep; onOpenFile?: (path: string) => void }) {
+  const [open, setOpen] = useState(step.status === 'running')
+  const userToggled = useRef(false)
+  const previousStatus = useRef(step.status)
+  const disclosureLabel = `${step.title}: ${step.summary} (step ${step.sequence})`
+  useEffect(() => {
+    if (previousStatus.current === 'running' && step.status !== 'running' && !userToggled.current) setOpen(false)
+    previousStatus.current = step.status
+  }, [step.status])
+  return <details aria-label={disclosureLabel} className={`execution-step state-${step.status}`} open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
+    <summary aria-label={disclosureLabel} onClick={() => { userToggled.current = true }}>
+      <span className="execution-status"><ExecutionStatusIcon status={step.status} /></span>
+      <span className="execution-step-copy"><strong>{step.title}</strong><small>{step.summary}</small></span>
+      {step.durationMs !== undefined ? <time>{formatDuration(step.durationMs)}</time> : null}
+      <ChevronRight className="execution-chevron" size={14} />
+    </summary>
+    <div className="execution-evidence">
+      {step.arguments ? <section><span>Arguments</span><pre>{JSON.stringify(step.arguments, null, 2)}</pre></section> : null}
+      {step.files.length ? <section><span>Files</span><div className="execution-files">{step.files.map((file) => (
+        <button type="button" key={`${file.path}:${file.startLine}`} onClick={() => onOpenFile?.(file.path)} disabled={!onOpenFile}>
+          <FilePenLine size={13} /><span>{file.path}</span><code>{file.startLine === file.endLine ? `L${file.startLine}` : `L${file.startLine}-${file.endLine}`}</code>
+        </button>
+      ))}</div></section> : null}
+      {step.output ? <section><span>Result</span><pre>{step.output}</pre></section> : null}
+      {step.details && !step.arguments && !step.output ? <section><span>Evidence</span><pre>{JSON.stringify(step.details, null, 2)}</pre></section> : null}
+    </div>
+  </details>
+}
+
+function ExecutionStepList({ steps, onOpenFile }: { steps: ExecutionStep[]; onOpenFile?: (path: string) => void }) {
+  return <div className="execution-steps">
+    {steps.map((step) => <ExecutionStepDisclosure step={step} onOpenFile={onOpenFile} key={step.id} />)}
+  </div>
+}
+
+function latestRunId(events: RuntimeEventRecord[]) {
+  return [...events]
+    .filter((event) => event.type === 'run.created')
+    .sort((left, right) => right.timestamp - left.timestamp || right.sequence - left.sequence)[0]?.runId
+    ?? events[0]?.runId
+}
+
+export function currentExecutionSummary(events: RuntimeEventRecord[], runId?: string | null) {
+  const relevant = events
+    .filter((event) => (!runId || event.runId === runId) && event.type !== 'model.delta')
+    .sort((left, right) => right.sequence - left.sequence || right.timestamp - left.timestamp)
+  const latest = relevant[0]
+  if (!latest) return 'Preparing run'
+  const item = eventItem(latest)
+  if (latest.type === 'tool.started') {
+    const name = firstString(item?.name) ?? 'tool'
+    return `${toolTitle(name)} · ${toolSummary(name, parsedArguments(item?.arguments))}`
+  }
+  if (latest.type === 'model.requested') return `Waiting for ${firstString(latest.payload.model) ?? 'model'} · turn ${String(latest.payload.round ?? 1)}`
+  if (latest.type === 'file.changed') return `Changed ${firstString(latest.payload.path) ?? 'workspace file'}`
+  if (latest.type === 'agent.started') return `Delegated · ${firstString(latest.payload.task) ?? 'specialist task'}`
+  if (latest.type === 'run.steered') return 'Applying active-run guidance'
+  if (latest.type === 'tool.completed') return `${toolTitle(firstString(item?.name) ?? 'tool')} completed`
+  if (latest.type === 'tool.failed') return `${toolTitle(firstString(item?.name) ?? 'tool')} failed`
+  return latest.type.replaceAll('.', ' ')
+}
+
+function ExecutionTimeline({ events, onOpenFile }: { events: RuntimeEventRecord[]; onOpenFile?: (path: string) => void }) {
+  const runId = latestRunId(events)
+  if (!runId) return null
+  const runEvents = events.filter((event) => event.runId === runId)
+  const started = runEvents.find((event) => event.type === 'run.created')
+  const status = executionStatus(runEvents)
+  const steps = executionSteps(runEvents)
+  return <section className={`execution-timeline state-${status}`} aria-label="运行执行步骤">
+    <header>
+      <span className="execution-run-mark"><Command size={14} /></span>
+      <span><strong>{firstString(started?.payload.provider) ?? 'Agent run'}</strong><small>{firstString(started?.payload.model) ?? runId.slice(0, 8)}</small></span>
+      <b>{status}</b>
+    </header>
+    <ExecutionStepList steps={steps} onOpenFile={onOpenFile} />
+  </section>
+}
+
 export function ConversationPanel({
   session,
   messages,
@@ -589,6 +967,8 @@ export function ConversationPanel({
   runActive = false,
   queuedPrompts = [],
   notice,
+  events = [],
+  onOpenExecutionFile,
   onSend,
   onRemoveQueued = () => undefined,
   onRunQueued = async () => undefined,
@@ -601,6 +981,8 @@ export function ConversationPanel({
   runActive?: boolean
   queuedPrompts?: QueuedPrompt[]
   notice?: string
+  events?: RuntimeEventRecord[]
+  onOpenExecutionFile?: (path: string) => void
   onSend: (text: string, mode: ComposerSendMode) => Promise<boolean>
   onRemoveQueued?: (id: string) => void
   onRunQueued?: (prompt: QueuedPrompt) => Promise<void>
@@ -657,6 +1039,7 @@ export function ConversationPanel({
         <div className="stream-date"><span />Today · {messages[0]?.time.slice(0, 5) ?? 'now'}<span /></div>
         {messages.map((message) => <MessageCard key={message.id} message={message} />)}
         {liveMessage ? <MessageCard message={liveMessage} /> : null}
+        {events.length ? <ExecutionTimeline events={events} onOpenFile={onOpenExecutionFile} /> : null}
         {activeWorker ? (
           <div className="agent-thinking">
             <span className="thinking-caret">›</span>
@@ -1044,21 +1427,35 @@ function parseUnifiedDiff(diff: string): ParsedDiffLine[] {
   })
 }
 
-function DiffView({ diff, path, loading, error }: { diff: string; path: string; loading: boolean; error: string | null }) {
+export function DiffView({ stagedDiff, workingDiff, path, loading, error }: { stagedDiff: string; workingDiff: string; path: string; loading: boolean; error: string | null }) {
+  const [scope, setScope] = useState<'staged' | 'working'>('working')
+  const hasStaged = Boolean(stagedDiff.trim())
+  const hasWorking = Boolean(workingDiff.trim())
+  const activeScope = scope === 'staged' && hasStaged || !hasWorking && hasStaged ? 'staged' : 'working'
+  const diff = activeScope === 'staged' ? stagedDiff : workingDiff
   const lines = useMemo(() => parseUnifiedDiff(diff), [diff])
   const additions = lines.filter((line) => line.type === 'add').length
   const deletions = lines.filter((line) => line.type === 'remove').length
 
+  useEffect(() => {
+    if (scope === 'staged' && !hasStaged && hasWorking) setScope('working')
+    if (scope === 'working' && !hasWorking && hasStaged) setScope('staged')
+  }, [hasStaged, hasWorking, path, scope])
+
   if (loading) return <div className="workspace-empty"><RefreshCw className="is-spinning" size={18} /><strong>Reading diff</strong></div>
   if (!path) return <div className="workspace-empty"><GitCompareArrows size={18} /><strong>Select a changed file</strong></div>
-  if (error && !diff.trim()) return <div className="workspace-empty is-error"><GitCompareArrows size={18} /><strong>Diff unavailable</strong><p>{error}</p></div>
-  if (!diff.trim()) return <div className="workspace-empty"><Check size={18} /><strong>No tracked diff</strong><p>The file is clean or currently untracked.</p></div>
+  if (error && !hasStaged && !hasWorking) return <div className="workspace-empty is-error"><GitCompareArrows size={18} /><strong>Diff unavailable</strong><p>{error}</p></div>
+  if (!hasStaged && !hasWorking) return <div className="workspace-empty"><Check size={18} /><strong>No tracked diff</strong><p>The file is clean.</p></div>
 
   return (
     <div className="diff-view" role="region" aria-label="代码差异">
       {error ? <div className="diff-error-note">Partial diff · {error}</div> : null}
+      <div className="diff-scope" aria-label="Diff scope">
+        <button type="button" className={activeScope === 'working' ? 'is-active' : ''} disabled={!hasWorking} onClick={() => setScope('working')}>Working</button>
+        <button type="button" className={activeScope === 'staged' ? 'is-active' : ''} disabled={!hasStaged} onClick={() => setScope('staged')}>Staged</button>
+      </div>
       <div className="diff-file-head">
-        <span>{path}</span>
+        <span>{path} · {activeScope === 'staged' ? 'staged for commit' : 'working tree'}</span>
         <span><b>+{additions}</b><i>−{deletions}</i></span>
       </div>
       {lines.map((line, index) => (
@@ -1173,21 +1570,24 @@ function deriveRuntimeAgents(events: RuntimeEventRecord[], root: Agent) {
   return [root, ...derived.values()]
 }
 
-function TerminalView({ runState, workspace, branch, events }: { runState: 'idle' | 'running'; workspace: WorkspaceView | null; branch: string; events: RuntimeEventRecord[] }) {
-  const commands = events.filter((event) => ['tool.started', 'tool.completed', 'tool.failed'].includes(event.type))
+export function TerminalView({ runState, workspace, branch, events }: { runState: 'idle' | 'running'; workspace: WorkspaceView | null; branch: string; events: RuntimeEventRecord[] }) {
+  const commands = [...new Set(events.map((event) => event.runId))]
+    .flatMap((runId) => executionSteps(events.filter((event) => event.runId === runId))
+      .filter((step) => step.kind === 'tool')
+      .map((step) => ({ runId, step })))
+    .sort((left, right) => right.step.timestamp - left.step.timestamp)
+    .slice(0, 24)
   return (
     <div className="terminal-view" role="log" aria-live="polite">
       <div><span className="prompt">trace@{branch}</span><span className="terminal-path"> {workspace?.path ?? '~'}</span> git status --short</div>
       {workspace?.snapshot.files.length ? workspace.snapshot.files.map((file) => (
         <div className="terminal-muted" key={file.path}> {file.indexStatus}{file.worktreeStatus} {file.path}</div>
       )) : <div className="terminal-pass"> ✓ Working tree clean</div>}
-      {commands.slice(0, 24).reverse().map((event) => {
-        const item = eventItem(event)
-        const completed = event.type === 'tool.completed'
-        const output = firstString(event.payload.output, item?.aggregated_output)
-        return <div key={event.id} className={completed ? 'terminal-muted' : event.type === 'tool.failed' ? 'terminal-error' : 'terminal-active'}>
-          <span className="prompt">{completed ? '$' : event.type === 'tool.failed' ? '×' : '›'}</span> {String(item?.command ?? item?.name ?? 'tool')}
-          {output ? <details><summary>Show output</summary><pre>{output}</pre></details> : null}
+      {commands.map(({ runId, step }) => {
+        const completed = step.status === 'completed'
+        return <div key={`${runId}:${step.id}`} className={completed ? 'terminal-muted' : step.status === 'failed' ? 'terminal-error' : 'terminal-active'}>
+          <span className="prompt">{completed ? '$' : step.status === 'failed' ? '×' : '›'}</span> {step.summary}
+          {step.output ? <details><summary>Show result · {formatDuration(step.durationMs) || step.status}</summary><pre>{step.output}</pre></details> : null}
         </div>
       })}
       {runState === 'running' ? <div className="terminal-active">› Traceframe run is active</div> : <div><span className="prompt">trace@{branch}</span><span className="cursor-block" /></div>}
@@ -1195,22 +1595,209 @@ function TerminalView({ runState, workspace, branch, events }: { runState: 'idle
   )
 }
 
-function ActivityView({ events }: { events: RuntimeEventRecord[] }) {
-  const visibleEvents = events.filter((event) => event.type !== 'model.delta')
+function TraceRunDisclosure({
+  run,
+  defaultOpen,
+  onOpenFile,
+}: {
+  run: { runId: string; events: RuntimeEventRecord[]; status: ExecutionStatus; steps: ExecutionStep[] }
+  defaultOpen: boolean
+  onOpenFile?: (path: string) => void
+}) {
+  const [open, setOpen] = useState(defaultOpen)
+  return <details className={`trace-run state-${run.status}`} open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
+    <summary>
+      <ExecutionStatusIcon status={run.status} />
+      <span><strong>Run {run.runId.slice(0, 8)}</strong><small>{run.steps.length} recorded steps</small></span>
+      <time>{new Date(run.events[0]?.timestamp ?? Date.now()).toLocaleTimeString()}</time>
+      <ChevronRight size={14} />
+    </summary>
+    <ExecutionStepList steps={run.steps} onOpenFile={onOpenFile} />
+  </details>
+}
+
+function ActivityView({ events, onOpenFile }: { events: RuntimeEventRecord[]; onOpenFile?: (path: string) => void }) {
+  const runIds = [...new Set(events.map((event) => event.runId))]
+  const runs = runIds.map((runId) => {
+    const runEvents = events.filter((event) => event.runId === runId)
+    return { runId, events: runEvents, status: executionStatus(runEvents), steps: executionSteps(runEvents) }
+  }).sort((left, right) => (right.events.at(-1)?.timestamp ?? 0) - (left.events.at(-1)?.timestamp ?? 0))
   return (
     <div className="trace-list" role="log" aria-live="polite">
-      {visibleEvents.slice(0, 100).map((event) => {
-        const item = eventItem(event)
-        const detail = firstString(item?.command, item?.name, item?.text, event.payload.text, event.payload.output, event.payload.error, item?.type)
-        return <article className="trace-event" key={event.id}>
-          <time>{new Date(event.timestamp).toLocaleTimeString()}</time>
-          <strong>{event.type}</strong>
-          <span>{detail ?? ''}</span>
-        </article>
-      })}
-      {!visibleEvents.length ? <div className="workspace-empty"><Activity size={18} /><strong>No runtime events</strong><p>Streaming text stays in Conversation; tool and lifecycle evidence appears here.</p></div> : null}
+      {runs.map((run, index) => (
+        <TraceRunDisclosure run={run} defaultOpen={index === 0 || run.status === 'failed'} onOpenFile={onOpenFile} key={run.runId} />
+      ))}
+      {!runs.length ? <div className="workspace-empty"><Activity size={18} /><strong>No runtime events</strong><p>Streaming text stays in Conversation; tool and lifecycle evidence appears here.</p></div> : null}
     </div>
   )
+}
+
+type GitOperationName = 'refresh' | 'switch' | 'create' | 'stage' | 'unstage' | 'commit' | 'pull' | 'push'
+
+export function GitPanel({
+  workspace,
+  history,
+  historyLoading,
+  historyError,
+  busy,
+  operation,
+  error,
+  output,
+  disabled,
+  onRefresh,
+  onSwitchBranch,
+  onCreateBranch,
+  onStageAll,
+  onUnstageAll,
+  onCommit,
+  onPull,
+  onPush,
+  onOpenFile,
+}: {
+  workspace: WorkspaceView | null
+  history: GitCommitRecord[]
+  historyLoading: boolean
+  historyError: string | null
+  busy: boolean
+  operation: GitOperationName | null
+  error: string | null
+  output: string
+  disabled: boolean
+  onRefresh: () => Promise<boolean>
+  onSwitchBranch: (branch: string) => Promise<boolean>
+  onCreateBranch: (branch: string) => Promise<boolean>
+  onStageAll: () => Promise<boolean>
+  onUnstageAll: () => Promise<boolean>
+  onCommit: (message: string) => Promise<boolean>
+  onPull: () => Promise<boolean>
+  onPush: () => Promise<boolean>
+  onOpenFile: (path: string) => void
+}) {
+  const [branchDraft, setBranchDraft] = useState('')
+  const [commitMessage, setCommitMessage] = useState('')
+  const [openSections, setOpenSections] = useState({ changes: true, history: false, branches: false })
+  const snapshot = workspace?.snapshot
+  const staged = snapshot?.files.filter((file) => file.indexStatus !== ' ' && file.indexStatus !== '?') ?? []
+  const unstaged = snapshot?.files.filter((file) => file.worktreeStatus !== ' ') ?? []
+  const locked = busy || disabled || !workspace
+  useEffect(() => {
+    setBranchDraft('')
+    setCommitMessage('')
+    setOpenSections({ changes: true, history: false, branches: false })
+  }, [workspace?.path])
+  const setSectionOpen = (section: keyof typeof openSections, open: boolean) => {
+    setOpenSections((current) => current[section] === open ? current : { ...current, [section]: open })
+  }
+  const submitBranch = async (event: FormEvent) => {
+    event.preventDefault()
+    const value = branchDraft.trim()
+    if (!value || locked) return
+    if (await onCreateBranch(value)) setBranchDraft('')
+  }
+  const submitCommit = async (event: FormEvent) => {
+    event.preventDefault()
+    const value = commitMessage.trim()
+    if (!value || locked || !staged.length) return
+    if (await onCommit(value)) setCommitMessage('')
+  }
+
+  if (!workspace || !snapshot) {
+    return <div className="source-panel source-empty"><GitFork size={18} /><strong>No Git repository</strong><p>Open a local repository to manage branches and changes.</p></div>
+  }
+
+  return <div className="source-panel">
+    <header className="source-head">
+      <div><span>Repository</span><strong>{workspace.name}</strong></div>
+      <button type="button" aria-label="Refresh Git status" title="Refresh Git status" disabled={locked} onClick={() => void onRefresh()}>
+        <RefreshCw className={operation === 'refresh' ? 'is-spinning' : ''} size={15} />
+      </button>
+    </header>
+
+    <form className="source-commit" onSubmit={submitCommit}>
+      <label htmlFor="source-commit-message">Commit staged changes</label>
+      <textarea id="source-commit-message" aria-label="Commit message" value={commitMessage} maxLength={2000} rows={3} disabled={locked} onChange={(event) => setCommitMessage(event.target.value)} placeholder="Commit message" />
+      <button type="submit" disabled={locked || !staged.length || !commitMessage.trim()}><GitCommitHorizontal size={14} />Commit {staged.length || ''}</button>
+    </form>
+
+    <details className="source-section source-changes" open={openSections.changes} onToggle={(event) => setSectionOpen('changes', event.currentTarget.open)}>
+      <summary className="source-section-title"><ChevronRight size={13} /><span>Changes</span><code>{snapshot.files.length}</code></summary>
+      <div className="source-section-body">
+        <div className="source-change-actions">
+          <button type="button" disabled={locked || !unstaged.length} onClick={() => void onStageAll()}><Plus size={13} />Stage all</button>
+          <button type="button" disabled={locked || !staged.length} onClick={() => void onUnstageAll()}><RotateCcw size={13} />Unstage all</button>
+        </div>
+        {staged.length ? <div className="source-change-group">
+          <span>Staged</span>
+          <div className="source-file-list">{staged.map((file) => (
+            <button type="button" key={`staged:${file.path}`} disabled={busy} onClick={() => onOpenFile(file.path)}>
+              <FileCode2 size={13} /><span>{file.path}</span><code>{file.indexStatus}</code>
+            </button>
+          ))}</div>
+        </div> : null}
+        {unstaged.length ? <div className="source-change-group">
+          <span>Working tree</span>
+          <div className="source-file-list">{unstaged.map((file) => (
+            <button type="button" key={`working:${file.path}`} disabled={busy} onClick={() => onOpenFile(file.path)}>
+              <FileCode2 size={13} /><span>{file.path}</span><code>{file.worktreeStatus === '?' ? '??' : file.worktreeStatus}</code>
+            </button>
+          ))}</div>
+        </div> : null}
+        {!snapshot.files.length ? <div className="source-file-list"><p>Working tree clean</p></div> : null}
+      </div>
+    </details>
+
+    <details className="source-section source-history" aria-label="Commit history" open={openSections.history} onToggle={(event) => setSectionOpen('history', event.currentTarget.open)}>
+      <summary className="source-section-title"><ChevronRight size={13} /><span>History</span><code>{history.length || ''}</code></summary>
+      <div className="source-section-body">
+        {historyLoading ? <div className="source-operation"><LoaderCircle className="is-spinning" size={13} />Loading history</div> : null}
+        {historyError ? <div className="source-result is-error" role="alert">History unavailable: {historyError}</div> : null}
+        {!historyLoading && !historyError && !history.length ? <p className="source-history-empty">No commits yet</p> : null}
+        <div className="source-history-list">
+          {history.map((commit) => (
+            <details className="source-history-entry" key={commit.hash}>
+              <summary>
+                <GitCommitHorizontal size={13} />
+                <span>{commit.subject || 'Commit without a subject'}</span>
+                <code>{commit.shortHash}</code>
+              </summary>
+              <div className="source-history-meta">
+                <span>{commit.author}</span>
+                <time dateTime={commit.authoredAt}>{new Date(commit.authoredAt).toLocaleString('zh-CN', { hour12: false })}</time>
+                <code title={commit.hash}>{commit.hash}</code>
+                {commit.refs.length ? <div>{commit.refs.map((reference) => <span key={reference}>{reference}</span>)}</div> : null}
+              </div>
+            </details>
+          ))}
+        </div>
+      </div>
+    </details>
+
+    <details className="source-section source-branches" open={openSections.branches} onToggle={(event) => setSectionOpen('branches', event.currentTarget.open)}>
+      <summary className="source-section-title"><ChevronRight size={13} /><span>Branches & remote</span><code>{snapshot.branch}</code></summary>
+      <div className="source-section-body">
+        <label className="source-field">
+          <span>Switch branch</span>
+          <select aria-label="Switch branch" value={snapshot.branch} disabled={locked} onChange={(event) => void onSwitchBranch(event.target.value)}>
+            {workspace.branches.map((branch) => <option key={branch} value={branch}>{branch}</option>)}
+          </select>
+        </label>
+        <form className="source-inline-form" onSubmit={submitBranch}>
+          <input aria-label="New branch name" value={branchDraft} maxLength={200} disabled={locked} onChange={(event) => setBranchDraft(event.target.value)} placeholder="New branch name" />
+          <button type="submit" disabled={locked || !branchDraft.trim()}><GitBranch size={14} />Create</button>
+        </form>
+        <div className="source-divergence">
+          <span>ahead {snapshot.ahead}</span><span>behind {snapshot.behind}</span>
+          <div />
+          <button type="button" disabled={locked} onClick={() => void onPull()}><Download size={13} />Pull</button>
+          <button type="button" disabled={locked} onClick={() => void onPush()}><Upload size={13} />Push</button>
+        </div>
+      </div>
+    </details>
+
+    {operation ? <div className="source-operation" role="status"><LoaderCircle className="is-spinning" size={13} />{operation}</div> : null}
+    {error ? <div className="source-result is-error" role="alert">{error}</div> : null}
+    {output ? <details className="source-result"><summary>Last Git result</summary><pre>{output}</pre></details> : null}
+  </div>
 }
 
 interface RepositoryDockProps {
@@ -1220,7 +1807,8 @@ interface RepositoryDockProps {
   workspace: WorkspaceView | null
   selectedFile: string
   file: WorkspaceFile | null
-  diff: string
+  stagedDiff: string
+  workingDiff: string
   loading: boolean
   fileLoading: boolean
   error: string | null
@@ -1255,7 +1843,8 @@ export function RepositoryDock({
   workspace,
   selectedFile,
   file,
-  diff,
+  stagedDiff,
+  workingDiff,
   loading,
   fileLoading,
   error,
@@ -1272,8 +1861,8 @@ export function RepositoryDock({
 }: RepositoryDockProps) {
   const breadcrumbs = selectedFile.split('/').filter(Boolean)
   const workspaceCtaDisabled = interactionBusy || branchBusy || loading || editor.saving
-  const displayedDiff = diff.trim() || !workspace || !file || file.path !== selectedFile || fileStatus(workspace.snapshot, selectedFile) !== 'U'
-    ? diff
+  const displayedWorkingDiff = workingDiff.trim() || !workspace || !file || file.path !== selectedFile || fileStatus(workspace.snapshot, selectedFile) !== 'U'
+    ? workingDiff
     : untrackedFileDiff(file)
   return (
     <section className={`repository-dock${error ? ' has-error' : ''}`} aria-label={mode === 'code' ? '代码文件' : '代码差异'}>
@@ -1320,7 +1909,7 @@ export function RepositoryDock({
                 onRevert={editor.onRevert}
                 onFollowAgent={onFollowAgent}
               />
-              : <DiffView diff={displayedDiff} path={selectedFile} loading={fileLoading} error={diffError} />}
+              : <DiffView stagedDiff={stagedDiff} workingDiff={displayedWorkingDiff} path={selectedFile} loading={fileLoading} error={diffError} />}
           </div>
         </div>
       </div>
@@ -1837,6 +2426,8 @@ export default function App() {
   })
   const [sessions, setSessions] = useState<Session[]>(previewInitial.sessions)
   const [activeSessionId, setActiveSessionId] = useState(previewInitial.activeSessionId)
+  const activeSessionIdRef = useRef(previewInitial.activeSessionId)
+  activeSessionIdRef.current = activeSessionId
   const [sessionMessages, setSessionMessages] = useState<Record<string, Message[]>>(() => desktop ? {} : loadStored('traceframe.session-messages', initialSessionMessages))
   const [sessionAgents, setSessionAgents] = useState<Record<string, Agent[]>>(() => desktop ? {} : loadStored('traceframe.session-agents', initialSessionAgents))
   const [memories, setMemories] = useState<MemoryRecord[]>(() => desktop ? [] : loadStored('traceframe.memories', initialMemories))
@@ -1859,7 +2450,8 @@ export default function App() {
   const [appError, setAppError] = useState<string | null>(null)
   const [selectedFile, setSelectedFile] = useState('')
   const [workspaceFile, setWorkspaceFile] = useState<WorkspaceFile | null>(null)
-  const [workspaceDiff, setWorkspaceDiff] = useState('')
+  const [workspaceStagedDiff, setWorkspaceStagedDiff] = useState('')
+  const [workspaceWorkingDiff, setWorkspaceWorkingDiff] = useState('')
   const [fileLoading, setFileLoading] = useState(false)
   const [fileError, setFileError] = useState<string | null>(null)
   const [diffError, setDiffError] = useState<string | null>(null)
@@ -1874,11 +2466,19 @@ export default function App() {
   const [latestAgentEdit, setLatestAgentEdit] = useState<AgentEditTarget | null>(null)
   const latestAgentEditRef = useRef<AgentEditTarget | null>(null)
   const [branchBusy, setBranchBusy] = useState(false)
+  const [gitOperation, setGitOperation] = useState<GitOperationName | null>(null)
+  const [gitOutput, setGitOutput] = useState('')
+  const [gitError, setGitError] = useState<string | null>(null)
+  const [gitHistory, setGitHistory] = useState<GitCommitRecord[]>([])
+  const [gitHistoryLoading, setGitHistoryLoading] = useState(false)
+  const [gitHistoryError, setGitHistoryError] = useState<string | null>(null)
   const [activeRunId, setActiveRunId] = useState<string | null>(null)
   const activeRunRef = useRef<string | null>(null)
   const cancelledRunIdsRef = useRef(new Set<string>())
   const workspacePickerPendingRef = useRef(false)
   const workspaceRequest = useRef(0)
+  const gitHistoryRequest = useRef(0)
+  const gitHistoryPathRef = useRef('')
   const fileRequest = useRef(0)
   const selectedFileRef = useRef('')
   const handledFileEventIdsRef = useRef(new Set<string>())
@@ -1891,6 +2491,7 @@ export default function App() {
   editorDirtyRef.current = editorDirty
   const [preferences, setPreferences] = useState<UiPreferences>(() => ({ ...defaultUiPreferences, ...loadStored('traceframe.appearance', defaultUiPreferences) }))
   const [dockModel, setDockModel] = useState(() => storedDockModel(preferences.layout))
+  const [activeRail, setActiveRail] = useState<RailComponent | null>(() => selectedRailComponent(dockModel, true))
 
   const showDock = useCallback((component: DockComponent) => {
     if (dockModel.getNodeById(component)) dockModel.doAction(Actions.selectTab(component))
@@ -1920,7 +2521,7 @@ export default function App() {
     setSessions(snapshot.sessions)
     setSessionMessages(grouped)
     setMemories(snapshot.memories)
-    setRuntimeEvents(snapshot.events)
+    setRuntimeEvents((current) => mergeSnapshotEvents(snapshot.events, current, activeSessionIdRef.current, Boolean(activeRunRef.current)))
     setActiveSessionId((current) => snapshot.sessions.some((session) => session.id === current) ? current : snapshot.sessions[0]?.id ?? '')
   }, [])
 
@@ -1928,11 +2529,33 @@ export default function App() {
     applySnapshot(await getAppSnapshot())
   }, [applySnapshot])
 
+  const loadGitHistory = useCallback(async (path: string) => {
+    const request = ++gitHistoryRequest.current
+    if (gitHistoryPathRef.current !== path) {
+      gitHistoryPathRef.current = path
+      setGitHistory([])
+    }
+    setGitHistoryLoading(true)
+    setGitHistoryError(null)
+    try {
+      const history = await getGitHistory(path)
+      if (request !== gitHistoryRequest.current) return
+      setGitHistory(history)
+    } catch (error) {
+      if (request !== gitHistoryRequest.current) return
+      setGitHistory([])
+      setGitHistoryError(errorMessage(error))
+    } finally {
+      if (request === gitHistoryRequest.current) setGitHistoryLoading(false)
+    }
+  }, [])
+
   const loadWorkspaceFile = useCallback(async (workspacePath: string, path: string) => {
     const request = ++fileRequest.current
     setSelectedFile(path)
     setWorkspaceFile(null)
-    setWorkspaceDiff('')
+    setWorkspaceStagedDiff('')
+    setWorkspaceWorkingDiff('')
     setFileLoading(true)
     setFileError(null)
     setDiffError(null)
@@ -1950,10 +2573,8 @@ export default function App() {
       setWorkspaceFile(null)
       setFileError(errorMessage(fileResult.reason))
     }
-    setWorkspaceDiff([
-      stagedDiff.status === 'fulfilled' ? stagedDiff.value : '',
-      workingDiff.status === 'fulfilled' ? workingDiff.value : '',
-    ].filter(Boolean).join('\n'))
+    setWorkspaceStagedDiff(stagedDiff.status === 'fulfilled' ? stagedDiff.value : '')
+    setWorkspaceWorkingDiff(workingDiff.status === 'fulfilled' ? workingDiff.value : '')
     const diffFailures = [stagedDiff, workingDiff]
       .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
       .map((result) => errorMessage(result.reason))
@@ -1988,7 +2609,8 @@ export default function App() {
       } else {
         setSelectedFile('')
         setWorkspaceFile(null)
-        setWorkspaceDiff('')
+        setWorkspaceStagedDiff('')
+        setWorkspaceWorkingDiff('')
         setFileError(null)
         setDiffError(null)
       }
@@ -1996,11 +2618,17 @@ export default function App() {
     } catch (error) {
       if (request !== workspaceRequest.current) return
       if (!workspaceRef.current) {
+        gitHistoryRequest.current += 1
+        gitHistoryPathRef.current = ''
+        setGitHistory([])
+        setGitHistoryLoading(false)
+        setGitHistoryError(null)
         fileRequest.current += 1
         setWorkspace(null)
         setSelectedFile('')
         setWorkspaceFile(null)
-        setWorkspaceDiff('')
+        setWorkspaceStagedDiff('')
+        setWorkspaceWorkingDiff('')
         setFileLoading(false)
         setFileError(null)
         setDiffError(null)
@@ -2017,14 +2645,14 @@ export default function App() {
     agentNavigationPendingRef.current = true
     agentNavigationOriginRef.current = selectedFileRef.current
     showDock('code')
-    void loadWorkspace(workspacePath, target.path)
-      .then((loaded) => {
-        if (loaded && agentNavigationTokenRef.current === token) lastLoadedAgentEditIdRef.current = target.eventId
+    void loadWorkspaceFile(workspacePath, target.path)
+      .then(() => {
+        if (agentNavigationTokenRef.current === token) lastLoadedAgentEditIdRef.current = target.eventId
       })
       .finally(() => {
         if (agentNavigationTokenRef.current === token) agentNavigationPendingRef.current = false
       })
-  }, [loadWorkspace, showDock])
+  }, [loadWorkspaceFile, showDock])
 
   const cancelAgentNavigation = useCallback((restoreOrigin: boolean) => {
     if (!agentNavigationPendingRef.current) return
@@ -2053,7 +2681,15 @@ export default function App() {
       }
       applySnapshot(snapshot)
       const initialSession = snapshot.sessions.find((session) => !session.archived) ?? snapshot.sessions[0]
-      if (initialSession) setActiveSessionId(initialSession.id)
+      if (initialSession) {
+        setActiveSessionId(initialSession.id)
+        try {
+          const events = await getSessionRuntimeEvents(initialSession.id)
+          setRuntimeEvents((current) => replaceSessionEvents(current, initialSession.id, events))
+        } catch (error) {
+          setAppError(`Session trace could not be loaded: ${errorMessage(error)}`)
+        }
+      }
       const recentWorkspace = await getRecentWorkspace().catch(() => null)
       const workspacePath = initialSession?.workspacePath || recentWorkspace
       if (!workspacePath) return
@@ -2075,6 +2711,23 @@ export default function App() {
     document.documentElement.dataset.layout = preferences.layout
     localStorage.setItem('traceframe.appearance', JSON.stringify(preferences))
   }, [preferences])
+
+  useEffect(() => {
+    setGitError(null)
+    setGitOutput('')
+  }, [workspace?.path])
+
+  useEffect(() => {
+    if (!workspace?.path) {
+      gitHistoryRequest.current += 1
+      gitHistoryPathRef.current = ''
+      setGitHistory([])
+      setGitHistoryLoading(false)
+      setGitHistoryError(null)
+      return
+    }
+    void loadGitHistory(workspace.path)
+  }, [loadGitHistory, workspace?.path])
 
   useEffect(() => {
     selectedFileRef.current = selectedFile
@@ -2191,10 +2844,10 @@ export default function App() {
     const root: Agent = {
       id: 'root', name: selectedProvider?.name ?? 'Traceframe', role: 'Orchestrator',
       model: selectedProvider?.model || 'Provider default', state: runState === 'running' ? 'working' : 'idle', progress: 0,
-      task: runState === 'running' ? 'Executing the active run' : 'Ready for the next task', color: 'cyan',
+      task: runState === 'running' ? currentExecutionSummary(activeEvents, activeRunId) : 'Ready for the next task', color: 'cyan',
     }
     return deriveRuntimeAgents(activeEvents, root)
-  }, [activeEvents, activeSession.id, desktop, runState, selectedProvider, sessionAgents])
+  }, [activeEvents, activeRunId, activeSession.id, desktop, runState, selectedProvider, sessionAgents])
 
   const confirmDiscardEditorChanges = (destination: string) => {
     if (!editorDirty) return true
@@ -2241,29 +2894,102 @@ export default function App() {
   }
 
   const changeBranch = async (nextBranch: string) => {
-    if (activeRunRef.current || editorSaving || !workspace || nextBranch === branch) return
-    if (!confirmDiscardEditorChanges('switching branches')) return
+    if (activeRunRef.current || editorSaving || gitOperation || !workspace || nextBranch === branch) return false
+    if (!confirmDiscardEditorChanges('switching branches')) return false
     const operation = workspaceRequest.current
     const workspacePath = workspace.path
     const previousBranch = branch
     setBranch(nextBranch)
     setBranchBusy(true)
+    setGitOperation('switch')
     setWorkspaceError(null)
+    let switched: Awaited<ReturnType<typeof switchGitBranch>>
     try {
-      await switchGitBranch(workspacePath, nextBranch)
-      if (operation !== workspaceRequest.current) return
-      await loadWorkspace(workspacePath, selectedFile)
-      if (desktop && activeSession.id !== 'loading' && !activeSession.archived) {
-        await updateNativeSessionScope(activeSession.id, nextBranch, workspacePath)
-        await reloadNativeState()
-      }
+      switched = await switchGitBranch(workspacePath, nextBranch)
     } catch (error) {
-      if (operation !== workspaceRequest.current) return
+      if (operation !== workspaceRequest.current) return false
       setBranch(previousBranch)
       setWorkspaceError(errorMessage(error))
-    } finally {
       setBranchBusy(false)
+      setGitOperation(null)
+      return false
     }
+
+    const switchedBranch = switched.snapshot?.branch ?? nextBranch
+    setBranch(switchedBranch)
+    const operationOutput = switched.output.trim() || `Switched to ${switchedBranch}`
+    setGitOutput(switched.refreshError ? `${operationOutput}\n\nStatus refresh pending: ${switched.refreshError}` : operationOutput)
+    await Promise.all([
+      loadWorkspace(workspacePath, selectedFile),
+      loadGitHistory(workspacePath),
+    ])
+    if (desktop && activeSession.id !== 'loading' && !activeSession.archived) {
+      try {
+        await updateNativeSessionScope(activeSession.id, switchedBranch, workspacePath)
+        await reloadNativeState()
+      } catch (error) {
+        setAppError(`Branch switched, but the session scope could not be updated: ${errorMessage(error)}`)
+      }
+    }
+    setBranchBusy(false)
+    setGitOperation(null)
+    return true
+  }
+
+  const refreshGit = async () => {
+    if (!workspace || gitOperation || branchBusy || activeRunRef.current || runCancelPending) return false
+    setGitOperation('refresh')
+    setGitError(null)
+    try {
+      const [loaded] = await Promise.all([
+        loadWorkspace(workspace.path, selectedFile),
+        loadGitHistory(workspace.path),
+      ])
+      return Boolean(loaded)
+    } catch (error) {
+      setGitError(errorMessage(error))
+      return false
+    } finally {
+      setGitOperation(null)
+    }
+  }
+
+  const performGitOperation = async (
+    name: Exclude<GitOperationName, 'refresh' | 'switch'>,
+    operation: (path: string) => Promise<{ snapshot: GitSnapshot | null; output: string; refreshError: string | null }>,
+  ) => {
+    if (!workspace || gitOperation || branchBusy || activeRunRef.current || runCancelPending || editorSaving) return false
+    const workspacePath = workspace.path
+    setGitOperation(name)
+    setGitError(null)
+    try {
+      const result = await operation(workspacePath)
+      const operationOutput = result.output.trim() || `${name} completed`
+      setGitOutput(result.refreshError ? `${operationOutput}\n\nStatus refresh pending: ${result.refreshError}` : operationOutput)
+      const [loaded] = await Promise.all([
+        loadWorkspace(workspacePath, selectedFile),
+        loadGitHistory(workspacePath),
+      ])
+      if (loaded && loaded.snapshot.branch !== activeSession.branch && desktop && activeSession.id !== 'loading' && !activeSession.archived) {
+        try {
+          await updateNativeSessionScope(activeSession.id, loaded.snapshot.branch, workspacePath)
+          await reloadNativeState()
+        } catch (error) {
+          setAppError(`Git ${name} completed, but the session scope could not be updated: ${errorMessage(error)}`)
+        }
+      }
+      return true
+    } catch (error) {
+      setGitError(errorMessage(error))
+      return false
+    } finally {
+      setGitOperation(null)
+    }
+  }
+
+  const createBranch = async (name: string) => {
+    if (!confirmDiscardEditorChanges('creating a branch')) return false
+    return performGitOperation('create', (path) => createGitBranch(path, name))
   }
 
   const saveWorkspaceFile = async () => {
@@ -2317,6 +3043,9 @@ export default function App() {
       return
     }
     setAppError(null)
+    void getSessionRuntimeEvents(session.id)
+      .then((events) => setRuntimeEvents((current) => replaceSessionEvents(current, session.id, events)))
+      .catch((error) => setAppError(`Session trace could not be loaded: ${errorMessage(error)}`))
     if (!session.workspacePath) {
       if (workspace && !session.archived) {
         try {
@@ -2457,7 +3186,7 @@ export default function App() {
       void (async () => {
         try {
           await startNativeRun({ runId, sessionId, workspacePath: workspace.path, branch, prompt: text, provider }, (event) => {
-            setRuntimeEvents((current) => [event, ...current.filter((item) => item.id !== event.id)].slice(0, 500))
+            setRuntimeEvents((current) => [event, ...current.filter((item) => item.id !== event.id)].slice(0, MAX_RENDERER_EVENTS))
             if (event.type === 'run.steered' && (!event.payload.agentId || event.payload.agentId === 'root')) {
               setComposerNotices((current) => ({ ...current, [sessionId]: 'Guidance applied at the next turn boundary' }))
             }
@@ -2657,6 +3386,7 @@ export default function App() {
     if (resetLayout) {
       const nextDockModel = Model.fromJson(dockLayoutJson(nextPreferences.layout))
       setDockModel(nextDockModel)
+      setActiveRail(selectedRailComponent(nextDockModel, true))
       localStorage.setItem(DOCK_LAYOUT_STORAGE_KEY, JSON.stringify(nextDockModel.toJson()))
     }
     setPreferences(nextPreferences)
@@ -2693,6 +3423,28 @@ export default function App() {
         workspacePickerPending={workspacePickerPending}
       />
     }
+    if (component === 'source') {
+      return <GitPanel
+        workspace={workspace}
+        history={gitHistory}
+        historyLoading={gitHistoryLoading}
+        historyError={gitHistoryError}
+        busy={Boolean(gitOperation) || branchBusy}
+        operation={gitOperation}
+        error={gitError}
+        output={gitOutput}
+        disabled={runState === 'running' || runCancelPending || workspacePickerPending || workspaceLoading || editorSaving}
+        onRefresh={refreshGit}
+        onSwitchBranch={changeBranch}
+        onCreateBranch={createBranch}
+        onStageAll={() => performGitOperation('stage', stageAllGitChanges)}
+        onUnstageAll={() => performGitOperation('unstage', unstageAllGitChanges)}
+        onCommit={(message) => performGitOperation('commit', (path) => commitGitChanges(path, message))}
+        onPull={() => performGitOperation('pull', pullGitBranch)}
+        onPush={() => performGitOperation('push', pushGitBranch)}
+        onOpenFile={(path) => { showDock('code'); selectWorkspaceFile(path) }}
+      />
+    }
     if (component === 'conversation') {
       return <ConversationPanel
         session={activeSession}
@@ -2703,6 +3455,8 @@ export default function App() {
         runActive={runState === 'running'}
         queuedPrompts={queuedPrompts.filter((prompt) => prompt.sessionId === activeSession.id)}
         notice={composerNotices[activeSession.id]}
+        events={activeEvents}
+        onOpenExecutionFile={(path) => { showDock('code'); selectWorkspaceFile(path) }}
         onSend={sendMessage}
         onRemoveQueued={removeQueuedPrompt}
         onRunQueued={runQueuedPrompt}
@@ -2717,7 +3471,8 @@ export default function App() {
         workspace={workspace}
         selectedFile={selectedFile}
         file={workspaceFile}
-        diff={workspaceDiff}
+        stagedDiff={workspaceStagedDiff}
+        workingDiff={workspaceWorkingDiff}
         loading={workspacePickerPending || workspaceLoading}
         fileLoading={fileLoading}
         error={workspaceError}
@@ -2749,7 +3504,7 @@ export default function App() {
       return <section className="dock-content" aria-label="运行输出"><TerminalView runState={runState} workspace={workspace} branch={branch} events={activeEvents} /></section>
     }
     if (component === 'trace') {
-      return <section className="dock-content" aria-label="运行轨迹"><ActivityView events={activeEvents} /></section>
+      return <section className="dock-content" aria-label="运行轨迹"><ActivityView events={activeEvents} onOpenFile={(path) => { showDock('code'); selectWorkspaceFile(path) }} /></section>
     }
     if (component === 'context') {
       return <section className="dock-content inspector-panel"><ContextPanel session={activeSession} messages={messages} events={activeEvents} memories={activeMemories} onCompact={compactContext} canCompact={desktop} /></section>
@@ -2813,6 +3568,8 @@ export default function App() {
         </div>
       ) : null}
       <AppRail
+        changeCount={workspace?.snapshot.files.length ?? 0}
+        active={activeRail}
         onShowSessions={() => focusDockControl('sessions', '.session-filter input')}
         onShowDock={showDock}
       />
@@ -2821,7 +3578,11 @@ export default function App() {
           model={dockModel}
           factory={dockFactory}
           realtimeResize
-          onModelChange={(nextModel) => localStorage.setItem(DOCK_LAYOUT_STORAGE_KEY, JSON.stringify(nextModel.toJson()))}
+          onModelChange={(nextModel) => {
+            localStorage.setItem(DOCK_LAYOUT_STORAGE_KEY, JSON.stringify(nextModel.toJson()))
+            const selected = selectedRailComponent(nextModel)
+            if (selected) setActiveRail(selected)
+          }}
         />
       </main>
       <StatusBar branch={branch} model={selectedProvider ? [selectedProvider.name, selectedProvider.model].filter(Boolean).join(' · ') : 'No provider'} native={native} workspace={workspace} />

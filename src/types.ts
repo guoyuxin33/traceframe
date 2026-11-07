@@ -77,6 +77,7 @@ export type RuntimeEventType =
   | 'agent.started'
   | 'agent.completed'
   | 'model.requested'
+  | 'model.completed'
   | 'model.delta'
   | 'tool.started'
   | 'tool.completed'

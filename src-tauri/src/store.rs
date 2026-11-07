@@ -10,6 +10,8 @@ use tauri::State;
 const MAX_CONTEXT_MEMORIES: usize = 24;
 const MAX_CONTEXT_SUMMARY_CHARS: usize = 12_000;
 const RECENT_MESSAGES_AFTER_COMPACTION: usize = 4;
+const MAX_SNAPSHOT_EVENTS_PER_SESSION: i64 = 1_000;
+const MAX_SNAPSHOT_EVENTS: i64 = 5_000;
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
@@ -271,6 +273,14 @@ impl AppStore {
                 events,
             })
         })
+    }
+
+    pub fn session_events(&self, session_id: &str) -> Result<Vec<EventRecord>, String> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Err("Session ID is required".into());
+        }
+        self.with_connection(|connection| query_session_events(connection, session_id))
     }
 
     pub fn reconcile_interrupted_runs(&self) -> Result<usize, String> {
@@ -808,30 +818,77 @@ fn query_memories(connection: &Connection) -> Result<Vec<MemoryRecord>, String> 
 
 fn query_events(connection: &Connection) -> Result<Vec<EventRecord>, String> {
     let mut statement = connection.prepare(
-        "SELECT id, session_id, run_id, sequence, event_type, payload, created_at FROM runtime_events ORDER BY created_at DESC, rowid DESC LIMIT 500",
+        "SELECT id, session_id, run_id, sequence, event_type, payload, created_at
+           FROM (
+             SELECT id, session_id, run_id, sequence, event_type, payload, created_at,
+                    ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY created_at DESC, rowid DESC) AS session_rank,
+                    rowid AS event_rowid
+               FROM runtime_events
+              WHERE event_type <> 'model.delta'
+           )
+          WHERE session_rank <= ?1
+          ORDER BY created_at DESC, event_rowid DESC
+          LIMIT ?2",
     ).map_err(|error| format!("Runtime events are unavailable: {error}"))?;
     let records = statement
-        .query_map([], |row| {
-            let payload: String = row.get(5)?;
-            Ok(EventRecord {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                run_id: row.get(2)?,
-                sequence: row.get(3)?,
-                event_type: row.get(4)?,
-                payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
-                created_at: row.get(6)?,
-            })
-        })
+        .query_map(
+            params![MAX_SNAPSHOT_EVENTS_PER_SESSION, MAX_SNAPSHOT_EVENTS],
+            map_event,
+        )
         .map_err(|error| format!("Runtime events could not be read: {error}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Runtime events could not be decoded: {error}"))?;
     Ok(records)
 }
 
+fn map_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecord> {
+    let payload: String = row.get(5)?;
+    Ok(EventRecord {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        run_id: row.get(2)?,
+        sequence: row.get(3)?,
+        event_type: row.get(4)?,
+        payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+        created_at: row.get(6)?,
+    })
+}
+
+fn query_session_events(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<EventRecord>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, session_id, run_id, sequence, event_type, payload, created_at
+           FROM runtime_events
+          WHERE session_id = ?1 AND event_type <> 'model.delta'
+          ORDER BY created_at DESC, rowid DESC
+          LIMIT ?2",
+        )
+        .map_err(|error| format!("Session events are unavailable: {error}"))?;
+    let records = statement
+        .query_map(
+            params![session_id, MAX_SNAPSHOT_EVENTS_PER_SESSION],
+            map_event,
+        )
+        .map_err(|error| format!("Session events could not be read: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Session events could not be decoded: {error}"))?;
+    Ok(records)
+}
+
 #[tauri::command]
 pub fn app_snapshot(store: State<'_, AppStore>) -> Result<AppSnapshot, String> {
     store.snapshot()
+}
+
+#[tauri::command]
+pub fn session_events(
+    session_id: String,
+    store: State<'_, AppStore>,
+) -> Result<Vec<EventRecord>, String> {
+    store.session_events(&session_id)
 }
 
 #[tauri::command]
@@ -897,9 +954,64 @@ pub fn compact_session(session_id: String, store: State<'_, AppStore>) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{AppStore, NewMemory, NewMessage};
+    use super::{query_events, query_session_events, AppStore, NewMemory, NewMessage};
     use rusqlite::Connection;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn session_event_query_recovers_traces_omitted_from_the_global_snapshot() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE runtime_events (
+                   id TEXT PRIMARY KEY,
+                   session_id TEXT NOT NULL,
+                   run_id TEXT NOT NULL,
+                   sequence INTEGER NOT NULL,
+                   event_type TEXT NOT NULL,
+                   payload TEXT NOT NULL,
+                   created_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        for session in 0..6 {
+            for sequence in 0..1_000 {
+                let ordinal = session * 1_000 + sequence;
+                transaction
+                    .execute(
+                        "INSERT INTO runtime_events (id, session_id, run_id, sequence, event_type, payload, created_at)
+                         VALUES (?1, ?2, ?3, ?4, 'tool.completed', '{}', ?5)",
+                        rusqlite::params![
+                            format!("event-{ordinal}"),
+                            format!("session-{session}"),
+                            format!("run-{session}"),
+                            sequence,
+                            ordinal,
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+        transaction
+            .execute(
+                "INSERT INTO runtime_events (id, session_id, run_id, sequence, event_type, payload, created_at)
+                 VALUES ('delta', 'session-0', 'run-0', 1001, 'model.delta', '{}', 10000)",
+                [],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let snapshot = query_events(&connection).unwrap();
+        assert_eq!(snapshot.len(), 5_000);
+        assert!(!snapshot.iter().any(|event| event.session_id == "session-0"));
+
+        let restored = query_session_events(&connection, "session-0").unwrap();
+        assert_eq!(restored.len(), 1_000);
+        assert!(restored
+            .iter()
+            .all(|event| event.event_type != "model.delta"));
+    }
 
     #[test]
     fn persists_sessions_messages_memories_and_compaction() {

@@ -1151,7 +1151,7 @@ fn tool_definitions(profile: AgentProfile, allow_delegate: bool) -> Vec<Value> {
         json!({
             "type": "function",
             "name": "run_command",
-            "description": "Run a bounded development command directly inside the workspace without a shell. Use this for tests, builds, formatting, Git inspection, or rg searches.",
+            "description": "Run a bounded development command directly inside the workspace without a shell. Use this for tests, builds, formatting, or rg searches; use the dedicated read-only Git tools for repository inspection.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1225,7 +1225,6 @@ fn command_allowed(program: &str) -> bool {
             | "bun"
             | "node"
             | "deno"
-            | "git"
             | "rg"
             | "grep"
             | "make"
@@ -1247,18 +1246,32 @@ fn diff_changed_range(diff: &str) -> Option<(usize, usize)> {
     Some((start, start.saturating_add(count - 1)))
 }
 
+fn diff_section_for_path<'a>(diff: &'a str, path: &str) -> &'a str {
+    let header_suffix = format!(" b/{path}");
+    let file_marker = format!("+++ b/{path}");
+    diff.split("diff --git ")
+        .find(|section| {
+            section
+                .lines()
+                .next()
+                .is_some_and(|header| header.ends_with(&header_suffix))
+                || section.lines().any(|line| line == file_marker)
+        })
+        .unwrap_or_default()
+}
+
 fn command_file_states(workspace: &Path) -> HashMap<String, CommandFileState> {
     let Ok(snapshot) = git_snapshot_at(workspace) else {
         return HashMap::new();
     };
+    let staged_diff = git_diff_at(workspace, true, None).unwrap_or_default();
+    let working_diff = git_diff_at(workspace, false, None).unwrap_or_default();
     snapshot
         .files
         .into_iter()
         .map(|file| {
-            let staged = git_diff_at(workspace, true, Some(file.path.clone()))
-                .unwrap_or_else(|error| format!("staged diff error: {error}"));
-            let working = git_diff_at(workspace, false, Some(file.path.clone()))
-                .unwrap_or_else(|error| format!("working diff error: {error}"));
+            let staged = diff_section_for_path(&staged_diff, &file.path);
+            let working = diff_section_for_path(&working_diff, &file.path);
             let preview = if staged.trim().is_empty() && working.trim().is_empty() {
                 read_workspace_file_at(workspace, file.path.clone())
                     .map(|file| file.content)
@@ -1905,6 +1918,7 @@ async fn run_responses_agent(
                 )?;
             }
         }
+        let model_started = Instant::now();
         emit_agent(
             on_event,
             store,
@@ -1974,6 +1988,23 @@ async fn run_responses_agent(
         else {
             return Ok(None);
         };
+        emit_agent(
+            on_event,
+            store,
+            request,
+            sequence,
+            "model.completed",
+            json!({
+                "round": model_turns,
+                "toolRound": tool_rounds,
+                "durationMs": model_started.elapsed().as_millis(),
+                "usage": round.usage,
+                "outputItemCount": round.output_items.len(),
+                "toolCallCount": round.tool_calls.len(),
+                "textChars": round.text.chars().count(),
+            }),
+            agent,
+        )?;
         usage_rounds.push(round.usage.clone());
         if round.tool_calls.is_empty() {
             if round.text.trim().is_empty() {
@@ -2269,6 +2300,7 @@ async fn run_responses_agent(
                     sequence,
                     "file.changed",
                     json!({
+                        "callId": call.call_id,
                         "path": change.path,
                         "tool": call.name,
                         "startLine": change.start_line,
@@ -2478,6 +2510,7 @@ pub async fn runtime_start(
         };
     }
 
+    let model_started = Instant::now();
     emit(
         &on_event,
         &store,
@@ -2700,6 +2733,21 @@ pub async fn runtime_start(
         return Err(error);
     }
 
+    emit(
+        &on_event,
+        &store,
+        &request,
+        &mut sequence,
+        "model.completed",
+        json!({
+            "round": 1,
+            "durationMs": model_started.elapsed().as_millis(),
+            "usage": usage,
+            "outputItemCount": 1,
+            "toolCallCount": 0,
+            "textChars": output.chars().count(),
+        }),
+    )?;
     active.close();
     if let Err(error) = store.append_message_record(NewMessage {
         session_id: request.session_id.clone(),
@@ -2741,8 +2789,8 @@ pub fn runtime_steer(
 mod tests {
     use super::{
         agent_instructions, anthropic_delta, anthropic_usage, api_url, await_cancellable_response,
-        changed_command_files, changed_line_range, command_file_states, diff_changed_range,
-        execute_tool, merge_usage, model_tool_output, parse_sse_data,
+        changed_command_files, changed_line_range, command_allowed, command_file_states,
+        diff_changed_range, execute_tool, merge_usage, model_tool_output, parse_sse_data,
         provider_healthcheck_with_timeout, read_bounded_output, response_failure,
         response_output_text, responses_input, run_responses_agent, send_anthropic_request,
         send_responses_request, take_sse_block, terminate_child, tool_definitions, ActiveRun,
@@ -3379,6 +3427,8 @@ mod tests {
 
     #[test]
     fn responses_tools_are_strict_and_cover_the_workspace_loop() {
+        assert!(!command_allowed("git"));
+        assert!(command_allowed("npm"));
         let tools = tool_definitions(AgentProfile::Root, true);
         let names = tools
             .iter()

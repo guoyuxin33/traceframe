@@ -3,8 +3,10 @@ use std::collections::HashSet;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -17,7 +19,7 @@ mod store;
 use runtime::{provider_healthcheck, runtime_cancel, runtime_start, runtime_steer, RuntimeControl};
 use store::{
     app_snapshot, append_message, archive_session, compact_session, create_session, delete_memory,
-    save_memory, update_memory, update_session_scope, AppStore,
+    save_memory, session_events, update_memory, update_session_scope, AppStore,
 };
 
 const MAX_TREE_ENTRIES: usize = 800;
@@ -28,7 +30,11 @@ const MAX_GIT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_GIT_ERROR_BYTES: usize = 64 * 1024;
 const MAX_DIFF_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DIFF_OUTPUT_LINES: usize = 4_000;
+const MAX_GIT_HISTORY_BYTES: usize = 512 * 1024;
+const MAX_GIT_HISTORY_ENTRIES: usize = 50;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT_NETWORK_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_COMMIT_MESSAGE_CHARS: usize = 2_000;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
@@ -68,6 +74,25 @@ struct GitSnapshot {
     ahead: u32,
     behind: u32,
     files: Vec<GitFileState>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitOperationResult {
+    snapshot: Option<GitSnapshot>,
+    output: String,
+    refresh_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitCommitRecord {
+    hash: String,
+    short_hash: String,
+    author: String,
+    authored_at: String,
+    refs: Vec<String>,
+    subject: String,
 }
 
 #[derive(Serialize)]
@@ -391,12 +416,19 @@ fn run_git_limited_with_timeout(
     label: &str,
     timeout: Duration,
 ) -> Result<String, String> {
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(path)
         .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .spawn()
         .map_err(|error| format!("Git could not be started: {error}"))?;
 
@@ -408,20 +440,9 @@ fn run_git_limited_with_timeout(
         .stderr
         .take()
         .ok_or_else(|| "Git error output could not be captured".to_string())?;
-    let stdout_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
-        stdout
-            .take((max_bytes + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::with_capacity(8 * 1024);
-        stderr
-            .take((MAX_GIT_ERROR_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
-    });
+    let stdout_reader = std::thread::spawn(move || read_bounded_and_drain(stdout, max_bytes));
+    let stderr_reader =
+        std::thread::spawn(move || read_bounded_and_drain(stderr, MAX_GIT_ERROR_BYTES));
     let started = Instant::now();
     let (status, timed_out) = loop {
         if let Some(status) = child
@@ -431,12 +452,7 @@ fn run_git_limited_with_timeout(
             break (status, false);
         }
         if started.elapsed() >= timeout {
-            child
-                .kill()
-                .map_err(|error| format!("Timed out Git command could not be stopped: {error}"))?;
-            let status = child
-                .wait()
-                .map_err(|error| format!("Timed out Git command could not be reaped: {error}"))?;
+            let status = terminate_git_process(&mut child)?;
             break (status, true);
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -469,6 +485,42 @@ fn run_git_limited_with_timeout(
     }
 
     Ok(String::from_utf8_lossy(&bytes).to_string())
+}
+
+fn read_bounded_and_drain(mut reader: impl Read, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let mut captured = Vec::with_capacity(max_bytes.min(64 * 1024));
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if captured.len() <= max_bytes {
+            let remaining = max_bytes.saturating_add(1).saturating_sub(captured.len());
+            captured.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+    }
+    Ok(captured)
+}
+
+fn terminate_git_process(child: &mut std::process::Child) -> Result<ExitStatus, String> {
+    #[cfg(unix)]
+    {
+        let process_group = -(child.id() as i32);
+        let result = unsafe { libc::kill(process_group, libc::SIGKILL) };
+        if result != 0 && child.try_wait().ok().flatten().is_none() {
+            child.kill().map_err(|error| {
+                format!("Timed out Git process group could not be stopped: {error}")
+            })?;
+        }
+    }
+    #[cfg(not(unix))]
+    child
+        .kill()
+        .map_err(|error| format!("Timed out Git command could not be stopped: {error}"))?;
+    child
+        .wait()
+        .map_err(|error| format!("Timed out Git command could not be reaped: {error}"))
 }
 
 #[tauri::command]
@@ -553,14 +605,88 @@ fn git_branches(path: String, access: State<'_, WorkspaceAccess>) -> Result<Vec<
     git_branches_at(&workspace)
 }
 
-fn git_switch_branch_at(workspace: &Path, branch: &str) -> Result<GitSnapshot, String> {
+fn parse_git_history(output: &str) -> Vec<GitCommitRecord> {
+    let fields = output.split('\0').collect::<Vec<_>>();
+    fields
+        .chunks(6)
+        .filter_map(|record| {
+            if record.len() != 6 {
+                return None;
+            }
+            let hash = record[0].trim_start_matches('\n').trim();
+            if hash.is_empty() {
+                return None;
+            }
+            Some(GitCommitRecord {
+                hash: hash.to_owned(),
+                short_hash: record[1].trim().to_owned(),
+                author: record[2].trim().to_owned(),
+                authored_at: record[3].trim().to_owned(),
+                refs: (!record[4].trim().is_empty())
+                    .then(|| vec![record[4].trim().to_owned()])
+                    .unwrap_or_default(),
+                subject: record[5].trim().to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn git_history_at(workspace: &Path) -> Result<Vec<GitCommitRecord>, String> {
+    if !git_head_exists_at(workspace)? {
+        return Ok(Vec::new());
+    }
+    let limit = format!("-{MAX_GIT_HISTORY_ENTRIES}");
+    let output = run_git_limited(
+        workspace,
+        &[
+            "log",
+            &limit,
+            "--date=iso-strict",
+            "--no-show-signature",
+            "--no-color",
+            "--pretty=format:%H%x00%h%x00%an%x00%aI%x00%D%x00%s%x00",
+        ],
+        MAX_GIT_HISTORY_BYTES,
+        "Git history",
+    )?;
+    Ok(parse_git_history(&output))
+}
+
+fn git_head_exists_at(workspace: &Path) -> Result<bool, String> {
+    match run_git(workspace, &["rev-parse", "--verify", "HEAD"]) {
+        Ok(_) => Ok(true),
+        Err(head_error) => {
+            let unborn = head_error.contains("Needed a single revision")
+                && run_git(workspace, &["symbolic-ref", "--quiet", "HEAD"]).is_ok();
+            if unborn {
+                Ok(false)
+            } else {
+                Err(format!("Git HEAD is unavailable: {head_error}"))
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn git_history(
+    path: String,
+    access: State<'_, WorkspaceAccess>,
+) -> Result<Vec<GitCommitRecord>, String> {
+    let workspace = access.resolve(&path)?;
+    git_history_at(&workspace)
+}
+
+fn git_switch_branch_at(workspace: &Path, branch: &str) -> Result<GitOperationResult, String> {
     let branches = run_git(workspace, &["branch", "--format=%(refname:short)"])?;
     if !branches.lines().any(|candidate| candidate == branch) {
         return Err("The selected local branch does not exist".into());
     }
 
-    run_git(workspace, &["switch", branch])?;
-    git_snapshot_at(workspace)
+    let output = run_git(
+        workspace,
+        &["-c", "core.hooksPath=/dev/null", "switch", branch],
+    )?;
+    git_operation_result(workspace, output)
 }
 
 #[tauri::command]
@@ -568,9 +694,304 @@ fn git_switch_branch(
     path: String,
     branch: String,
     access: State<'_, WorkspaceAccess>,
-) -> Result<GitSnapshot, String> {
+) -> Result<GitOperationResult, String> {
     let workspace = access.resolve(&path)?;
+    let _write_guard = access
+        .writes
+        .lock()
+        .map_err(|_| "Workspace write state is unavailable".to_string())?;
     git_switch_branch_at(&workspace, &branch)
+}
+
+fn git_operation_result(workspace: &Path, output: String) -> Result<GitOperationResult, String> {
+    match git_snapshot_at(workspace) {
+        Ok(snapshot) => Ok(GitOperationResult {
+            snapshot: Some(snapshot),
+            output,
+            refresh_error: None,
+        }),
+        Err(error) => Ok(GitOperationResult {
+            snapshot: None,
+            output,
+            refresh_error: Some(error),
+        }),
+    }
+}
+
+fn git_create_branch_at(workspace: &Path, branch: &str) -> Result<GitOperationResult, String> {
+    let branch = branch.trim();
+    if branch.is_empty() || branch.chars().count() > 200 {
+        return Err("Branch name must be between 1 and 200 characters".into());
+    }
+    run_git(workspace, &["check-ref-format", "--branch", branch])?;
+    let output = run_git(
+        workspace,
+        &["-c", "core.hooksPath=/dev/null", "switch", "-c", branch],
+    )?;
+    git_operation_result(workspace, output)
+}
+
+#[tauri::command]
+fn git_create_branch(
+    path: String,
+    branch: String,
+    access: State<'_, WorkspaceAccess>,
+) -> Result<GitOperationResult, String> {
+    let workspace = access.resolve(&path)?;
+    let _write_guard = access
+        .writes
+        .lock()
+        .map_err(|_| "Workspace write state is unavailable".to_string())?;
+    git_create_branch_at(&workspace, &branch)
+}
+
+fn git_stage_all_at(workspace: &Path) -> Result<GitOperationResult, String> {
+    run_git(workspace, &["add", "--all"])?;
+    git_operation_result(workspace, "Staged all workspace changes".into())
+}
+
+#[tauri::command]
+fn git_stage_all(
+    path: String,
+    access: State<'_, WorkspaceAccess>,
+) -> Result<GitOperationResult, String> {
+    let workspace = access.resolve(&path)?;
+    let _write_guard = access
+        .writes
+        .lock()
+        .map_err(|_| "Workspace write state is unavailable".to_string())?;
+    git_stage_all_at(&workspace)
+}
+
+fn git_unstage_all_at(workspace: &Path) -> Result<GitOperationResult, String> {
+    if git_head_exists_at(workspace)? {
+        run_git(workspace, &["reset", "--mixed", "HEAD", "--"])?;
+    } else {
+        run_git(
+            workspace,
+            &["rm", "--cached", "-r", "--ignore-unmatch", "--", "."],
+        )?;
+    }
+    git_operation_result(
+        workspace,
+        "Moved staged changes back to the working tree".into(),
+    )
+}
+
+#[tauri::command]
+fn git_unstage_all(
+    path: String,
+    access: State<'_, WorkspaceAccess>,
+) -> Result<GitOperationResult, String> {
+    let workspace = access.resolve(&path)?;
+    let _write_guard = access
+        .writes
+        .lock()
+        .map_err(|_| "Workspace write state is unavailable".to_string())?;
+    git_unstage_all_at(&workspace)
+}
+
+fn git_commit_at(workspace: &Path, message: &str) -> Result<GitOperationResult, String> {
+    let message = message.trim();
+    if message.is_empty() || message.chars().count() > MAX_COMMIT_MESSAGE_CHARS {
+        return Err(format!(
+            "Commit message must be between 1 and {MAX_COMMIT_MESSAGE_CHARS} characters"
+        ));
+    }
+    if run_git(workspace, &["diff", "--cached", "--name-only"])?
+        .trim()
+        .is_empty()
+    {
+        return Err("Stage at least one change before committing".into());
+    }
+    let output = run_git(
+        workspace,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "--no-gpg-sign",
+            "-m",
+            message,
+        ],
+    )?;
+    git_operation_result(workspace, output)
+}
+
+#[tauri::command]
+fn git_commit(
+    path: String,
+    message: String,
+    access: State<'_, WorkspaceAccess>,
+) -> Result<GitOperationResult, String> {
+    let workspace = access.resolve(&path)?;
+    let _write_guard = access
+        .writes
+        .lock()
+        .map_err(|_| "Workspace write state is unavailable".to_string())?;
+    git_commit_at(&workspace, &message)
+}
+
+fn run_git_network(workspace: &Path, args: &[&str]) -> Result<String, String> {
+    let mut configured = vec![
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "protocol.https.allow=always",
+        "-c",
+        "protocol.ssh.allow=always",
+    ];
+    configured.extend_from_slice(args);
+    run_git_limited_with_timeout(
+        workspace,
+        &configured,
+        MAX_GIT_OUTPUT_BYTES,
+        "Git output",
+        GIT_NETWORK_TIMEOUT,
+    )
+}
+
+fn git_current_branch_at(workspace: &Path) -> Result<String, String> {
+    let branch = run_git(workspace, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Err("Git operation is unavailable while HEAD is detached".into());
+    }
+    Ok(branch.to_owned())
+}
+
+fn git_upstream_at(workspace: &Path) -> Result<Option<(String, String)>, String> {
+    let current = git_current_branch_at(workspace)?;
+    let reference = format!("refs/heads/{current}");
+    let tracking = run_git(
+        workspace,
+        &[
+            "for-each-ref",
+            "--format=%(upstream:remotename)%00%(upstream:remoteref)",
+            &reference,
+        ],
+    )?;
+    let (remote, merge) = tracking
+        .trim()
+        .split_once('\0')
+        .ok_or_else(|| "The current branch has unreadable upstream configuration".to_string())?;
+    if remote.is_empty() && merge.is_empty() {
+        return Ok(None);
+    }
+    let branch = merge
+        .trim()
+        .strip_prefix("refs/heads/")
+        .filter(|branch| !branch.is_empty())
+        .ok_or_else(|| "The current branch has no usable upstream".to_string())?;
+    if remote.is_empty() || remote == "." {
+        return Err("The configured upstream is not a remote branch".into());
+    }
+    let remotes = run_git(workspace, &["remote"])?;
+    if !remotes.lines().any(|candidate| candidate == remote) {
+        return Err("The configured upstream remote is unavailable".into());
+    }
+    Ok(Some((remote.to_owned(), branch.to_owned())))
+}
+
+fn git_publish_target_at(workspace: &Path) -> Result<(String, String, bool), String> {
+    if let Some((remote, branch)) = git_upstream_at(workspace)? {
+        return Ok((remote, branch, false));
+    }
+    let branch = git_current_branch_at(workspace)?;
+    let remotes = run_git(workspace, &["remote"])?
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let remote = if remotes.iter().any(|candidate| candidate == "origin") {
+        "origin".to_owned()
+    } else if remotes.len() == 1 {
+        remotes[0].clone()
+    } else if remotes.is_empty() {
+        return Err("Push requires a configured Git remote".into());
+    } else {
+        return Err("Push requires an upstream when multiple remotes are configured".into());
+    };
+    Ok((remote, branch, true))
+}
+
+fn git_pull_at(workspace: &Path) -> Result<GitOperationResult, String> {
+    if !git_snapshot_at(workspace)?.files.is_empty() {
+        return Err("Pull requires a clean working tree".into());
+    }
+    let (remote, branch) = git_upstream_at(workspace)?
+        .ok_or_else(|| "Pull requires the current branch to have an upstream".to_string())?;
+    let output = run_git_network(workspace, &["pull", "--ff-only", &remote, &branch])?;
+    git_operation_result(
+        workspace,
+        if output.trim().is_empty() {
+            "Pull completed".into()
+        } else {
+            output
+        },
+    )
+}
+
+#[tauri::command]
+fn git_pull(
+    path: String,
+    access: State<'_, WorkspaceAccess>,
+) -> Result<GitOperationResult, String> {
+    let workspace = access.resolve(&path)?;
+    let _write_guard = access
+        .writes
+        .lock()
+        .map_err(|_| "Workspace write state is unavailable".to_string())?;
+    git_pull_at(&workspace)
+}
+
+fn git_push_at(workspace: &Path) -> Result<GitOperationResult, String> {
+    let snapshot = git_snapshot_at(workspace)?;
+    if snapshot.branch == "HEAD" {
+        return Err("Push is unavailable while HEAD is detached".into());
+    }
+    let (remote, upstream_branch, publish) = git_publish_target_at(workspace)?;
+    let refspec = format!("HEAD:refs/heads/{upstream_branch}");
+    let output = if publish {
+        run_git_network(
+            workspace,
+            &[
+                "push",
+                "--porcelain",
+                "--no-signed",
+                "--set-upstream",
+                &remote,
+                &refspec,
+            ],
+        )?
+    } else {
+        run_git_network(
+            workspace,
+            &["push", "--porcelain", "--no-signed", &remote, &refspec],
+        )?
+    };
+    git_operation_result(
+        workspace,
+        if output.trim().is_empty() {
+            "Push completed".into()
+        } else {
+            output
+        },
+    )
+}
+
+#[tauri::command]
+fn git_push(
+    path: String,
+    access: State<'_, WorkspaceAccess>,
+) -> Result<GitOperationResult, String> {
+    let workspace = access.resolve(&path)?;
+    let _write_guard = access
+        .writes
+        .lock()
+        .map_err(|_| "Workspace write state is unavailable".to_string())?;
+    git_push_at(&workspace)
 }
 
 fn git_diff_at(
@@ -990,12 +1411,20 @@ pub fn run() {
             recent_workspace,
             git_snapshot,
             git_branches,
+            git_history,
             git_switch_branch,
+            git_create_branch,
+            git_stage_all,
+            git_unstage_all,
+            git_commit,
+            git_pull,
+            git_push,
             git_diff,
             workspace_tree,
             read_workspace_file,
             write_workspace_file,
             app_snapshot,
+            session_events,
             create_session,
             update_session_scope,
             archive_session,
@@ -1016,15 +1445,17 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_workspace_file_at, git_diff_at, git_snapshot_at, git_switch_branch_at,
-        parse_git_snapshot, read_workspace_file_at, run_git_limited_with_timeout,
+        create_workspace_file_at, git_commit_at, git_create_branch_at, git_diff_at, git_history_at,
+        git_publish_target_at, git_snapshot_at, git_stage_all_at, git_switch_branch_at,
+        git_unstage_all_at, git_upstream_at, parse_git_history, parse_git_snapshot,
+        read_bounded_and_drain, read_workspace_file_at, run_git_limited_with_timeout,
         safe_relative_path, workspace_tree_at, write_workspace_file_at, WorkspaceAccess,
         MAX_DIFF_OUTPUT_LINES, MAX_FILE_PREVIEW_BYTES, MAX_FILE_PREVIEW_LINES, MAX_TREE_ENTRIES,
     };
     use std::fs;
     use std::path::Path;
     use std::process::Command;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn run_test_git(path: &Path, args: &[&str]) {
         let status = Command::new("git")
@@ -1054,6 +1485,26 @@ mod tests {
         assert_eq!(nul_snapshot.files.len(), 2);
         assert_eq!(nul_snapshot.files[0].path, "src/新名称.ts");
         assert_eq!(nul_snapshot.files[1].path, "src/中文.ts");
+    }
+
+    #[test]
+    fn parses_commit_history_with_refs_and_record_boundaries() {
+        let history = parse_git_history(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0aaaaaaa\0Ada\02026-11-07T10:00:00+08:00\0HEAD -> main, origin/main\0feat: source control\0\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\0bbbbbbb\0Lin\02026-11-06T09:00:00+08:00\0\0fix: timeout\0",
+        );
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].short_hash, "aaaaaaa");
+        assert_eq!(history[0].refs, vec!["HEAD -> main, origin/main"]);
+        assert_eq!(history[1].hash, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert_eq!(history[1].subject, "fix: timeout");
+    }
+
+    #[test]
+    fn bounded_readers_keep_draining_after_the_preview_limit() {
+        let input = vec![b'x'; 64 * 1024];
+        let captured = read_bounded_and_drain(std::io::Cursor::new(input), 1024).unwrap();
+        assert_eq!(captured.len(), 1025);
     }
 
     #[test]
@@ -1338,6 +1789,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn stops_git_commands_that_exceed_the_deadline() {
+        let started = Instant::now();
         let error = run_git_limited_with_timeout(
             Path::new("/tmp"),
             &["-c", "alias.traceframe-hang=!sleep 3", "traceframe-hang"],
@@ -1347,6 +1799,7 @@ mod tests {
         )
         .expect_err("the command should time out");
         assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
@@ -1413,6 +1866,107 @@ mod tests {
     }
 
     #[test]
+    fn creates_stages_unstages_and_commits_from_explicit_git_controls() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "traceframe-git-controls-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&workspace).expect("workspace should be created");
+        fs::write(workspace.join("README.md"), "base\n").expect("fixture should be written");
+        run_test_git(&workspace, &["init", "-b", "main"]);
+        run_test_git(&workspace, &["config", "user.name", "Traceframe Test"]);
+        run_test_git(
+            &workspace,
+            &["config", "user.email", "traceframe-test@example.invalid"],
+        );
+        assert!(git_history_at(&workspace)
+            .expect("unborn repositories should have empty history")
+            .is_empty());
+        run_test_git(&workspace, &["add", "."]);
+        run_test_git(&workspace, &["commit", "-m", "fixture"]);
+        let canonical = workspace
+            .canonicalize()
+            .expect("workspace should canonicalize");
+
+        let created = git_create_branch_at(&canonical, "feature/source")
+            .expect("branch should be created and checked out");
+        assert_eq!(created.snapshot.unwrap().branch, "feature/source");
+        assert!(git_create_branch_at(&canonical, "bad branch").is_err());
+
+        fs::write(workspace.join("source.txt"), "change\n").expect("change should be written");
+        let staged = git_stage_all_at(&canonical).expect("changes should stage");
+        assert_eq!(staged.snapshot.unwrap().files[0].index_status, "A");
+        let unstaged = git_unstage_all_at(&canonical).expect("changes should unstage");
+        assert_eq!(unstaged.snapshot.unwrap().files[0].worktree_status, "?");
+        git_stage_all_at(&canonical).expect("changes should stage again");
+        let committed = git_commit_at(&canonical, "feat: source controls")
+            .expect("staged changes should commit");
+        assert!(committed.snapshot.unwrap().files.is_empty());
+        let history = git_history_at(&canonical).expect("history should load");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].subject, "feat: source controls");
+        assert_eq!(history[1].subject, "fixture");
+        assert!(git_commit_at(&canonical, "empty commit").is_err());
+
+        fs::remove_dir_all(workspace).expect("temporary workspace should be removed");
+    }
+
+    #[test]
+    fn resolves_slash_remote_names_and_safe_first_push_targets() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "traceframe-git-upstream-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&workspace).expect("workspace should be created");
+        fs::write(workspace.join("README.md"), "base\n").expect("fixture should be written");
+        run_test_git(&workspace, &["init", "-b", "main"]);
+        run_test_git(&workspace, &["add", "."]);
+        run_test_git(
+            &workspace,
+            &[
+                "-c",
+                "user.name=Traceframe Test",
+                "-c",
+                "user.email=traceframe@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        );
+        let remote_path = workspace.join("unused-remote.git");
+        let remote_path = remote_path.to_string_lossy().to_string();
+        run_test_git(&workspace, &["remote", "add", "team/origin", &remote_path]);
+        run_test_git(&workspace, &["config", "branch.main.remote", "team/origin"]);
+        run_test_git(
+            &workspace,
+            &["config", "branch.main.merge", "refs/heads/main"],
+        );
+        let canonical = workspace
+            .canonicalize()
+            .expect("workspace should canonicalize");
+
+        assert_eq!(
+            git_upstream_at(&canonical).expect("upstream should parse"),
+            Some(("team/origin".into(), "main".into()))
+        );
+        run_test_git(&workspace, &["switch", "-c", "unpublished"]);
+        assert_eq!(
+            git_publish_target_at(&canonical).expect("first push target should resolve"),
+            ("team/origin".into(), "unpublished".into(), true)
+        );
+
+        fs::remove_dir_all(workspace).expect("temporary workspace should be removed");
+    }
+
+    #[test]
     fn reads_real_workspace_and_switches_branch() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1453,7 +2007,7 @@ mod tests {
 
         let switched =
             git_switch_branch_at(&canonical, "review").expect("local branch should switch");
-        assert_eq!(switched.branch, "review");
+        assert_eq!(switched.snapshot.unwrap().branch, "review");
         fs::write(workspace.join("src/main.ts"), "export const value = 9\n")
             .expect("review fixture should be updated");
         run_test_git(&workspace, &["add", "."]);
