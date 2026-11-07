@@ -4,7 +4,7 @@ Traceframe is a native Tauri coding workspace that keeps model activity, tool ca
 
 ![Traceframe workspace](docs/assets/traceframe-workspace.png)
 
-_Traceframe 0.3 running as a native macOS application with a real local repository loaded._
+_Traceframe 0.3 running as a native macOS application with a real local repository loaded. Preview and Terminal are additional draggable dock tabs in the current build._
 
 ## Current development build
 
@@ -14,7 +14,8 @@ _Traceframe 0.3 running as a native macOS application with a real local reposito
 | Implemented | GFM model replies and an execution timeline with numbered steps, per-step disclosures, and expand/collapse-all controls that pair model turns, commands, arguments, results, edited files, line ranges, and agent lifecycle evidence; Traceframe-owned Responses API agent loop with streamed output, cancellation, host-side in-run guidance, separate queued follow-up turns, bounded tools, timing, and usage |
 | Implemented | Model-directed serial delegation to as many as four bounded child agents per run, with host-enforced read-only `scout`/`reviewer` and write-capable `worker` profiles, inherited provider/model/workspace scope, non-recursive child tools, and visible parent/child events |
 | Implemented | Direct OpenAI Responses, local CC Switch Responses routing, Anthropic streaming, and OpenAI-compatible chat providers; provider health checks and model discovery |
-| Planned | Isolated child worktrees, conflict-aware merge queues, per-agent configuration, authoritative context budgets, and interactive terminal input |
+| Implemented | A real PTY terminal for the authorized workspace; local project start/stop/restart; loopback-only project preview; element selection that adds structured HTML context to the active conversation draft; and explicit terminal staging for preview and deployment commands |
+| Planned | Isolated child worktrees, conflict-aware merge queues, per-agent configuration, authoritative context budgets, production deployment adapters, and hosted preview URLs |
 
 Traceframe does not launch Codex or delegate its coding loop to a Codex process. The Rust host sends requests to the selected model provider and executes Traceframe's own tools.
 
@@ -46,12 +47,18 @@ Every main surface is a dock tab and can be rearranged and resized. Code, diff, 
 | Conversation | Render streamed and completed model replies as GitHub-flavored Markdown; inspect numbered model, command, file, and agent steps individually or expand/collapse the whole run; send with Enter, add a line with Shift+Enter, guide an active Responses run, or manage queued follow-up turns |
 | Code | Preview, edit, save, revert, detect conflicting external changes, and follow agent edits to the current file and changed line range without discarding local drafts |
 | Diff | Inspect staged and unstaged changes for the selected file |
+| Preview | Start, stop, or atomically restart a local development server; load a loopback URL; inspect project logs; select a rendered element; and append its selector, text, geometry, and bounded HTML to the current conversation draft for an AI-assisted edit |
+| Terminal | Use a real interactive PTY rooted in the authorized workspace, including shell input, ANSI output, resizing, restart, clear, and close. Commands prepared by Preview are inserted only after an explicit click and are never executed until the user presses Enter |
 | Source | Open Source Control from the left activity rail; refresh status; inspect staged and working-tree changes separately; create or switch branches; stage, unstage, commit, fast-forward pull, push or publish, and expand the latest 50 commit records |
 | Output and trace | Inspect paired command output and per-run model, tool, file-change, usage, completion, failure, and cancellation evidence with global expand/collapse controls |
 | Context and memory | Review deterministic session summaries and manage session, project, and global memory records |
 | Agents | Follow the root agent and real delegated specialists, including their task, parent, model, progress state, and result |
 
-Filesystem operations stay behind the Rust host. The workspace bridge rejects traversal, symlink escapes, binary files, oversized writes, truncated previews, and stale overwrites. Agent commands run without a shell, with a program allowlist, output limits, and timeouts, but they still run with the desktop user's operating-system permissions. A permission broker and stronger process isolation remain roadmap work.
+Filesystem operations stay behind the Rust host. The workspace bridge rejects traversal, symlink escapes, binary files, oversized writes, truncated previews, and stale overwrites. Agent commands run without a shell, with a program allowlist, output limits, and timeouts. The interactive terminal is intentionally a separate user-controlled PTY and does not expand the agent command allowlist. Preview pages pass through a short-lived loopback proxy fixed to the selected local origin; redirects cannot change origin, HTML injection is bounded, and the rendered page stays cross-origin from the Tauri host. These processes still run with the desktop user's operating-system permissions; a permission broker and stronger process isolation remain roadmap work.
+
+Preview's deployment action defaults to staging `npx vercel --prod` in Terminal. This is a confirmation boundary, not an automatic deployment integration: Traceframe neither runs the command nor presses Enter, and provider-specific deployment status and hosted URL capture remain roadmap work.
+
+Preview starts with `npm run dev`. Projects that use another development server can replace the program and arguments from Preview settings. The loopback proxy keeps scripts, styles, and module imports on one isolated preview origin, so frameworks do not need to relax CORS for Traceframe.
 
 ## Development
 

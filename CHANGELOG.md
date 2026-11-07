@@ -21,6 +21,10 @@ This project has no tagged public release yet. The current package version is `0
 - Pi-style host-side steering for Responses runs, with a distinct `Guide run` composer mode, durable user messages, bounded FIFO delivery at root turn boundaries, and `run.steered` trace evidence.
 - Host-enforced `scout`, `reviewer`, and `worker` child-agent profiles with read-only tool boundaries for investigation and review.
 - Numbered execution steps with expand-all and collapse-all controls in Conversation and Trace.
+- Real interactive PTY terminal sessions rooted in the authorized workspace, with ANSI streaming, resizing, restart, clear, and close controls.
+- Local project preview lifecycle controls, loopback URL loading, bounded project logs, and atomic restart-and-refresh behavior.
+- Preview element selection that creates a structured conversation draft with selector, visible text, geometry, and bounded HTML context.
+- Explicit command staging from Preview to Terminal for development and deployment commands; staged commands are never automatically executed.
 
 ### Changed
 
@@ -35,6 +39,8 @@ This project has no tagged public release yet. The current package version is `0
 - Active tool results are bounded before re-entering model context, while command output pipes continue draining to EOF.
 - Chat and Anthropic streams require their terminal frame before a reply is persisted as complete.
 - Code, diff, output, and execution-evidence surfaces use a dedicated high-contrast code palette and adapt to narrow dock widths.
+- Code, Diff, Preview, Terminal, Output, and Trace are separate draggable tabs so project interaction and execution evidence can be positioned independently.
+- Project pages load through an ephemeral loopback proxy so scripts, styles, and module imports work without weakening the desktop host's script policy.
 
 ### Fixed
 
@@ -48,6 +54,7 @@ This project has no tagged public release yet. The current package version is `0
 - Untracked text files render as complete added-file diffs from their bounded preview.
 - Trace hides per-delta stream fragments, and Output keeps tool payloads collapsed until requested.
 - Formatter and generator changes made through bounded commands emit file-change events for Trace and editor following.
+- Preview servers are stopped as process groups during stop, restart, and application shutdown so child processes do not remain behind.
 
 ### Security
 
@@ -55,3 +62,5 @@ This project has no tagged public release yet. The current package version is `0
 - Manually entered API keys are excluded from repository files, local storage, and the application SQLite database in the current development flow.
 - CC Switch routes are restricted to loopback and never receive renderer-supplied authorization headers.
 - Non-UTF-8 previews are rejected at every file size, including truncated previews.
+- Preview proxy targets are restricted to loopback HTTP or HTTPS, redirects stay on the configured origin, HTML injection is bounded, and the selector bridge runs on an origin isolated from the Tauri host.
+- User terminal input and agent command execution remain separate permission paths; Preview can stage a terminal command but cannot submit it.

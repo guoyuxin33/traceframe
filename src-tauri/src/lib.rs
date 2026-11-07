@@ -13,13 +13,23 @@ use std::time::{Duration, Instant};
 use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
+mod preview;
+mod preview_proxy;
 mod runtime;
 mod store;
+mod terminal;
 
+use preview::{
+    preview_fetch_document, preview_logs, preview_proxy_open, preview_restart, preview_start,
+    preview_start_stream, preview_status, preview_stop, PreviewManager,
+};
 use runtime::{provider_healthcheck, runtime_cancel, runtime_start, runtime_steer, RuntimeControl};
 use store::{
     app_snapshot, append_message, archive_session, compact_session, create_session, delete_memory,
     save_memory, session_events, update_memory, update_session_scope, AppStore,
+};
+use terminal::{
+    terminal_close, terminal_kill, terminal_resize, terminal_start, terminal_write, TerminalManager,
 };
 
 const MAX_TREE_ENTRIES: usize = 800;
@@ -1388,6 +1398,8 @@ pub fn run() {
         .manage(WorkspaceAccess::default())
         .manage(AppStore::default())
         .manage(RuntimeControl::default())
+        .manage(TerminalManager::default())
+        .manage(PreviewManager::default())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let config_dir = app
@@ -1436,10 +1448,36 @@ pub fn run() {
             provider_healthcheck,
             runtime_start,
             runtime_cancel,
-            runtime_steer
+            runtime_steer,
+            terminal_start,
+            terminal_write,
+            terminal_resize,
+            terminal_close,
+            terminal_kill,
+            preview_start,
+            preview_start_stream,
+            preview_stop,
+            preview_restart,
+            preview_status,
+            preview_logs,
+            preview_fetch_document,
+            preview_proxy_open
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Traceframe");
+        .build(tauri::generate_context!())
+        .expect("error while building Traceframe")
+        .run(|app_handle, event| {
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                if let Err(error) = app_handle.state::<PreviewManager>().shutdown() {
+                    eprintln!("Preview process cleanup failed during application exit: {error}");
+                }
+                if let Err(error) = app_handle.state::<TerminalManager>().shutdown() {
+                    eprintln!("Terminal cleanup failed during application exit: {error}");
+                }
+            }
+        });
 }
 
 #[cfg(test)]

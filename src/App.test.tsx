@@ -19,9 +19,12 @@ import {
   TerminalView,
   SessionsPanel,
   TopBar,
+  DOCK_LAYOUT_SCHEMA_VERSION,
+  DOCK_LAYOUT_STORAGE_KEY,
   activeSessionIdAfterArchive,
   agentEditTarget,
   currentExecutionSummary,
+  dockLayoutJson,
   executionSteps,
   firstActiveSessionId,
   isRetiredOpenAiModel,
@@ -31,6 +34,8 @@ import {
   requestWorkspaceSelection,
   runtimeAgentState,
   shouldFocusPromptShortcut,
+  storedDockModel,
+  terminalDraftAfterConsume,
   untrackedFileDiff,
   validateWorkspaceCandidate,
 } from './App'
@@ -67,6 +72,61 @@ const activeSession: Session = { id: 'first', title: 'First', summary: 'Active w
 function runtimeEvent(sequence: number, type: RuntimeEventRecord['type'], payload: Record<string, unknown> = {}): RuntimeEventRecord {
   return { id: `event-${sequence}`, sessionId: 'first', runId: 'run-1', sequence, type, payload, timestamp: 1_700_000_000_000 + sequence }
 }
+
+function legacyDockLayout(omitted: Set<string>) {
+  const layout = structuredClone(dockLayoutJson('balanced'))
+  const visit = (node: { children?: Array<{ component?: string; children?: unknown[] }> }) => {
+    if (!node.children) return
+    node.children = node.children.filter((child) => !child.component || !omitted.has(child.component))
+    node.children.forEach((child) => visit(child as { children?: Array<{ component?: string; children?: unknown[] }> }))
+  }
+  visit(layout.layout as unknown as { children?: Array<{ component?: string; children?: unknown[] }> })
+  return layout
+}
+
+describe('dock layout schema migration', () => {
+  it('migrates v4 layouts in place and persists an explicit schema envelope', () => {
+    const legacy = legacyDockLayout(new Set(['preview', 'terminal']))
+    ;(legacy.layout as { children: Array<{ weight?: number }> }).children[0].weight = 31
+    localStorage.setItem('traceframe.dock-layout.v4', JSON.stringify(legacy))
+
+    const model = storedDockModel('code')
+    const preview = model.getNodeById('preview')
+    const terminal = model.getNodeById('terminal')
+    expect(preview).toBeTruthy()
+    expect(terminal).toBeTruthy()
+    expect(preview?.getParent()).toBe(model.getNodeById('code')?.getParent())
+    expect(terminal?.getParent()).toBe(model.getNodeById('output')?.getParent())
+    expect((model.toJson().layout as { children: Array<{ weight?: number }> }).children[0].weight).toBe(31)
+
+    const stored = JSON.parse(localStorage.getItem(DOCK_LAYOUT_STORAGE_KEY)!)
+    expect(stored.schemaVersion).toBe(DOCK_LAYOUT_SCHEMA_VERSION)
+    expect(JSON.stringify(stored.model)).toContain('"component":"preview"')
+    expect(JSON.stringify(stored.model)).toContain('"component":"terminal"')
+  })
+
+  it('repairs stale same-key schemas and resets structurally incomplete layouts', () => {
+    const stale = legacyDockLayout(new Set(['preview']))
+    localStorage.setItem(DOCK_LAYOUT_STORAGE_KEY, JSON.stringify({ schemaVersion: 4, model: stale }))
+    expect(storedDockModel('balanced').getNodeById('preview')).toBeTruthy()
+
+    localStorage.clear()
+    const corrupt = legacyDockLayout(new Set(['conversation', 'preview', 'terminal']))
+    localStorage.setItem(DOCK_LAYOUT_STORAGE_KEY, JSON.stringify({ schemaVersion: DOCK_LAYOUT_SCHEMA_VERSION, model: corrupt }))
+    const reset = storedDockModel('conversation')
+    expect(reset.getNodeById('conversation')).toBeTruthy()
+    expect(reset.getNodeById('preview')).toBeTruthy()
+    expect(reset.getNodeById('terminal')).toBeTruthy()
+  })
+
+  it('does not overwrite a layout written by a newer app schema', () => {
+    const future = JSON.stringify({ schemaVersion: DOCK_LAYOUT_SCHEMA_VERSION + 1, model: legacyDockLayout(new Set()) })
+    localStorage.setItem(DOCK_LAYOUT_STORAGE_KEY, future)
+    const fallback = storedDockModel('balanced')
+    expect(fallback.getNodeById('preview')).toBeTruthy()
+    expect(localStorage.getItem(DOCK_LAYOUT_STORAGE_KEY)).toBe(future)
+  })
+})
 
 describe('session interaction state', () => {
   it('chooses the explicit active preview session and moves away after archiving it', () => {
@@ -152,6 +212,33 @@ describe('conversation controls', () => {
     await user.click(screen.getByRole('button', { name: '发送消息' }))
     await waitFor(() => expect(onSend).toHaveBeenCalledWith('first draft', 'run'))
     expect(screen.getByRole('textbox', { name: '发送给主智能体' })).toHaveValue('')
+  })
+
+  it('adds selected preview context to the active draft without sending it', async () => {
+    const onSend = vi.fn().mockResolvedValue(true)
+    const view = render(<ConversationPanel
+      session={activeSession}
+      messages={[]}
+      agents={[]}
+      disabled={false}
+      draftRequest={{ id: 'selection-1', sessionId: activeSession.id, text: 'Update `button.save` in the preview' }}
+      onSend={onSend}
+    />)
+
+    const composer = screen.getByRole('textbox', { name: '发送给主智能体' })
+    await waitFor(() => expect(composer).toHaveValue('Update `button.save` in the preview'))
+    expect(composer).toHaveFocus()
+    expect(onSend).not.toHaveBeenCalled()
+
+    view.rerender(<ConversationPanel
+      session={activeSession}
+      messages={[]}
+      agents={[]}
+      disabled={false}
+      draftRequest={{ id: 'selection-2', sessionId: activeSession.id, text: 'Keep the existing hover state' }}
+      onSend={onSend}
+    />)
+    await waitFor(() => expect(composer).toHaveValue('Update `button.save` in the preview\n\nKeep the existing hover state'))
   })
 
   it('keeps an unsuccessful draft and disables archived composers', async () => {
@@ -246,6 +333,13 @@ describe('conversation controls', () => {
 
     await user.click(screen.getByRole('button', { name: '运行下一条排队消息' }))
     expect(onRunQueued).toHaveBeenCalledWith(expect.objectContaining({ id: 'queued-1', text: 'Continue after review' }))
+  })
+})
+
+describe('preview terminal command handoff', () => {
+  it('clears only the command that Terminal actually consumed', () => {
+    expect(terminalDraftAfterConsume('npm run dev', 'npm run dev')).toBe('')
+    expect(terminalDraftAfterConsume('npm run build', 'npm run dev')).toBe('npm run build')
   })
 })
 

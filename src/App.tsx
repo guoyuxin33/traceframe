@@ -105,6 +105,8 @@ import {
   type WorkspaceTreeEntry,
 } from './native'
 import type { RuntimeEventRecord } from './types'
+import { PreviewPanel } from './PreviewPanel'
+import { TerminalPanel } from './TerminalPanel'
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
@@ -124,6 +126,16 @@ export interface QueuedPrompt {
   id: string
   sessionId: string
   text: string
+}
+
+export interface ComposerDraftRequest {
+  id: string
+  sessionId: string
+  text: string
+}
+
+export function terminalDraftAfterConsume(current: string, consumed: string) {
+  return current === consumed ? '' : current
 }
 
 export type ComposerSendMode = 'run' | 'steer' | 'queue'
@@ -179,8 +191,10 @@ const defaultUiPreferences: UiPreferences = {
   layout: 'balanced',
 }
 
-const DOCK_LAYOUT_STORAGE_KEY = 'traceframe.dock-layout.v3'
-const DOCK_COMPONENTS = ['sessions', 'source', 'conversation', 'code', 'diff', 'output', 'trace', 'context', 'agents', 'memory'] as const
+export const DOCK_LAYOUT_STORAGE_KEY = 'traceframe.dock-layout'
+export const DOCK_LAYOUT_SCHEMA_VERSION = 5
+const LEGACY_DOCK_LAYOUT_STORAGE_KEYS = ['traceframe.dock-layout.v4', 'traceframe.dock-layout.v3', 'traceframe.dock-layout.v2'] as const
+const DOCK_COMPONENTS = ['sessions', 'source', 'conversation', 'code', 'diff', 'preview', 'terminal', 'output', 'trace', 'context', 'agents', 'memory'] as const
 type DockComponent = typeof DOCK_COMPONENTS[number]
 type RailComponent = Extract<DockComponent, 'sessions' | 'source' | 'agents' | 'memory'>
 
@@ -199,7 +213,7 @@ function dockTab(id: DockComponent, name: string) {
   return { type: 'tab' as const, id, name, component: id }
 }
 
-function dockLayoutJson(preset: UiPreferences['layout']): IJsonModel {
+export function dockLayoutJson(preset: UiPreferences['layout']): IJsonModel {
   const weights = preset === 'code' ? [18, 20, 45, 17] : preset === 'conversation' ? [18, 38, 27, 17] : [18, 28, 37, 17]
   const workspaceWeights = preset === 'code' ? [72, 28] : preset === 'conversation' ? [58, 42] : [66, 34]
   return {
@@ -220,8 +234,8 @@ function dockLayoutJson(preset: UiPreferences['layout']): IJsonModel {
           weight: weights[2],
           minWidth: 360,
           children: [
-            { type: 'tabset', weight: workspaceWeights[0], minHeight: 240, children: [dockTab('code', 'Code'), dockTab('diff', 'Diff')] },
-            { type: 'tabset', weight: workspaceWeights[1], minHeight: 160, children: [dockTab('output', 'Output'), dockTab('trace', 'Trace')] },
+            { type: 'tabset', weight: workspaceWeights[0], minHeight: 240, children: [dockTab('code', 'Code'), dockTab('diff', 'Diff'), dockTab('preview', 'Preview')] },
+            { type: 'tabset', weight: workspaceWeights[1], minHeight: 160, children: [dockTab('terminal', 'Terminal'), dockTab('output', 'Output'), dockTab('trace', 'Trace')] },
           ],
         },
         { type: 'tabset', weight: weights[3], minWidth: 220, children: [dockTab('context', 'Context'), dockTab('agents', 'Agents'), dockTab('memory', 'Memory')] },
@@ -238,19 +252,130 @@ function collectDockComponents(node: unknown, result: string[] = []) {
   return result
 }
 
-function isValidDockLayout(value: IJsonModel) {
+export function isValidDockLayout(value: IJsonModel) {
   const components = collectDockComponents(value.layout).sort()
   const required = [...DOCK_COMPONENTS].sort()
   return components.length === required.length && components.every((component, index) => component === required[index])
 }
 
-function storedDockModel(preset: UiPreferences['layout']) {
-  try {
-    const stored = loadStored<IJsonModel>(DOCK_LAYOUT_STORAGE_KEY, dockLayoutJson(preset))
-    return Model.fromJson(isValidDockLayout(stored) ? stored : dockLayoutJson(preset))
-  } catch {
-    return Model.fromJson(dockLayoutJson(preset))
+interface MutableDockNode {
+  component?: string
+  children?: MutableDockNode[]
+}
+
+interface PersistedDockLayout {
+  schemaVersion: number
+  model: IJsonModel
+}
+
+function dockParentFor(node: MutableDockNode, components: Set<string>): MutableDockNode | null {
+  if (node.children?.some((child) => child.component && components.has(child.component))) return node
+  for (const child of node.children ?? []) {
+    const parent = dockParentFor(child, components)
+    if (parent) return parent
   }
+  return null
+}
+
+export function migrateDockLayout(value: IJsonModel): IJsonModel | null {
+  if (isValidDockLayout(value)) return value
+  const components = collectDockComponents(value.layout)
+  const unique = new Set(components)
+  const required = new Set<string>(DOCK_COMPONENTS)
+  if (unique.size !== components.length || components.some((component) => !required.has(component))) return null
+  const missing = DOCK_COMPONENTS.filter((component) => !unique.has(component))
+  if (missing.some((component) => component !== 'preview' && component !== 'terminal')) return null
+
+  const migrated = JSON.parse(JSON.stringify(value)) as IJsonModel
+  const layout = migrated.layout as unknown as MutableDockNode
+  if (missing.includes('preview')) {
+    const workspaceParent = dockParentFor(layout, new Set(['code', 'diff']))
+    if (!workspaceParent?.children) return null
+    workspaceParent.children.push(dockTab('preview', 'Preview'))
+  }
+  if (missing.includes('terminal')) {
+    const outputParent = dockParentFor(layout, new Set(['output', 'trace']))
+    if (!outputParent?.children) return null
+    outputParent.children.unshift(dockTab('terminal', 'Terminal'))
+  }
+  return isValidDockLayout(migrated) ? migrated : null
+}
+
+function decodedDockLayout(raw: string): { kind: 'valid'; model: IJsonModel } | { kind: 'future' | 'invalid' } {
+  try {
+    const parsed = JSON.parse(raw) as Partial<PersistedDockLayout> | IJsonModel
+    if (typeof (parsed as Partial<PersistedDockLayout>).schemaVersion === 'number') {
+      const stored = parsed as Partial<PersistedDockLayout>
+      if (!Number.isSafeInteger(stored.schemaVersion) || !stored.model) return { kind: 'invalid' }
+      if (stored.schemaVersion! > DOCK_LAYOUT_SCHEMA_VERSION) return { kind: 'future' }
+      const migrated = migrateDockLayout(stored.model)
+      return migrated ? { kind: 'valid', model: migrated } : { kind: 'invalid' }
+    }
+    const migrated = migrateDockLayout(parsed as IJsonModel)
+    return migrated ? { kind: 'valid', model: migrated } : { kind: 'invalid' }
+  } catch {
+    return { kind: 'invalid' }
+  }
+}
+
+export function persistDockModel(model: Model) {
+  const stored: PersistedDockLayout = { schemaVersion: DOCK_LAYOUT_SCHEMA_VERSION, model: model.toJson() }
+  try {
+    const current = localStorage.getItem(DOCK_LAYOUT_STORAGE_KEY)
+    if (current) {
+      const parsed = JSON.parse(current) as Partial<PersistedDockLayout>
+      if (typeof parsed.schemaVersion === 'number' && parsed.schemaVersion > DOCK_LAYOUT_SCHEMA_VERSION) return
+    }
+    localStorage.setItem(DOCK_LAYOUT_STORAGE_KEY, JSON.stringify(stored))
+  } catch {
+    // A restricted webview can still use the in-memory model.
+  }
+}
+
+export function storedDockModel(preset: UiPreferences['layout']) {
+  const fallback = () => Model.fromJson(dockLayoutJson(preset))
+  let current: string | null = null
+  try {
+    current = localStorage.getItem(DOCK_LAYOUT_STORAGE_KEY)
+  } catch {
+    return fallback()
+  }
+  if (current) {
+    const decoded = decodedDockLayout(current)
+    if (decoded.kind === 'future') return fallback()
+    if (decoded.kind === 'valid') {
+      try {
+        const model = Model.fromJson(decoded.model)
+        persistDockModel(model)
+        return model
+      } catch {
+        // Continue through legacy layouts before resetting corrupt state.
+      }
+    }
+  }
+
+  for (const key of LEGACY_DOCK_LAYOUT_STORAGE_KEYS) {
+    let raw: string | null = null
+    try {
+      raw = localStorage.getItem(key)
+    } catch {
+      return fallback()
+    }
+    if (!raw) continue
+    const decoded = decodedDockLayout(raw)
+    if (decoded.kind !== 'valid') continue
+    try {
+      const model = Model.fromJson(decoded.model)
+      persistDockModel(model)
+      return model
+    } catch {
+      // Try the next known legacy schema.
+    }
+  }
+
+  const model = fallback()
+  persistDockModel(model)
+  return model
 }
 
 function loadStored<T>(key: string, fallback: T): T {
@@ -998,6 +1123,7 @@ export function ConversationPanel({
   disabled,
   runActive = false,
   queuedPrompts = [],
+  draftRequest,
   notice,
   events = [],
   onOpenExecutionFile,
@@ -1012,6 +1138,7 @@ export function ConversationPanel({
   disabled: boolean
   runActive?: boolean
   queuedPrompts?: QueuedPrompt[]
+  draftRequest?: ComposerDraftRequest | null
   notice?: string
   events?: RuntimeEventRecord[]
   onOpenExecutionFile?: (path: string) => void
@@ -1025,6 +1152,8 @@ export function ConversationPanel({
   const submittingRef = useRef(false)
   const wasRunActive = useRef(runActive)
   const streamEnd = useRef<HTMLDivElement>(null)
+  const composerInput = useRef<HTMLTextAreaElement>(null)
+  const handledDraftRequest = useRef('')
   const draft = drafts[session.id] ?? ''
   const workingAgents = agents.filter((agent) => agent.state === 'working')
   const activeWorker = workingAgents.find((agent) => agent.parent) ?? workingAgents[0]
@@ -1037,6 +1166,18 @@ export function ConversationPanel({
     if (runActive && !wasRunActive.current) setRunInputMode('steer')
     wasRunActive.current = runActive
   }, [runActive])
+
+  useEffect(() => {
+    if (!draftRequest || draftRequest.sessionId !== session.id || handledDraftRequest.current === draftRequest.id) return
+    handledDraftRequest.current = draftRequest.id
+    const requestedText = draftRequest.text.trim()
+    if (!requestedText) return
+    setDrafts((current) => {
+      const existing = (current[session.id] ?? '').trim()
+      return { ...current, [session.id]: existing ? `${existing}\n\n${requestedText}` : requestedText }
+    })
+    requestAnimationFrame(() => composerInput.current?.focus())
+  }, [draftRequest, session.id])
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
@@ -1120,6 +1261,7 @@ export function ConversationPanel({
         ) : null}
         {notice ? <div className="composer-notice" role="status" aria-live="polite">{notice}</div> : null}
         <textarea
+          ref={composerInput}
           value={draft}
           onChange={(event) => setDrafts((current) => ({ ...current, [session.id]: event.target.value }))}
           onKeyDown={(event) => {
@@ -2476,6 +2618,9 @@ export default function App() {
   const [runtimeEvents, setRuntimeEvents] = useState<RuntimeEventRecord[]>([])
   const [queuedPrompts, setQueuedPrompts] = useState<QueuedPrompt[]>([])
   const [composerNotices, setComposerNotices] = useState<Record<string, string>>({})
+  const [composerDraftRequest, setComposerDraftRequest] = useState<ComposerDraftRequest | null>(null)
+  const [terminalCommandDraft, setTerminalCommandDraft] = useState('')
+  const composerDraftSequence = useRef(0)
   const queuedPromptsRef = useRef<QueuedPrompt[]>([])
   const [branch, setBranch] = useState('main')
   const [model, setModel] = useState(() => loadStored('traceframe.model', 'cc-switch'))
@@ -3429,7 +3574,7 @@ export default function App() {
       const nextDockModel = Model.fromJson(dockLayoutJson(nextPreferences.layout))
       setDockModel(nextDockModel)
       setActiveRail(selectedRailComponent(nextDockModel, true))
-      localStorage.setItem(DOCK_LAYOUT_STORAGE_KEY, JSON.stringify(nextDockModel.toJson()))
+      persistDockModel(nextDockModel)
     }
     setPreferences(nextPreferences)
     localStorage.setItem('traceframe.providers', JSON.stringify(next.map(({ id, name, endpoint, model: providerModel, adapter }) => ({ id, name, endpoint, model: providerModel, adapter, connected: false, latency: 0 }))))
@@ -3496,6 +3641,7 @@ export default function App() {
         disabled={Boolean(activeSession.archived)}
         runActive={runState === 'running'}
         queuedPrompts={queuedPrompts.filter((prompt) => prompt.sessionId === activeSession.id)}
+        draftRequest={composerDraftRequest}
         notice={composerNotices[activeSession.id]}
         events={activeEvents}
         onOpenExecutionFile={(path) => { showDock('code'); selectWorkspaceFile(path) }}
@@ -3539,6 +3685,38 @@ export default function App() {
           onDraft: setEditorDraft,
           onSave: () => void saveWorkspaceFile(),
           onRevert: revertWorkspaceFile,
+        }}
+      />
+    }
+    if (component === 'preview') {
+      return <PreviewPanel
+        workspacePath={workspace?.path ?? null}
+        disabled={!desktop || workspaceLoading || workspacePickerPending}
+        onAddToConversation={(prompt) => {
+          if (!activeSession.id || activeSession.archived) {
+            setAppError('Restore an active session before adding preview context.')
+            return
+          }
+          composerDraftSequence.current += 1
+          setComposerDraftRequest({
+            id: `preview-${Date.now()}-${composerDraftSequence.current}`,
+            sessionId: activeSession.id,
+            text: prompt,
+          })
+          showDock('conversation')
+        }}
+        onOpenTerminalCommand={(command) => {
+          setTerminalCommandDraft(command)
+          showDock('terminal')
+        }}
+      />
+    }
+    if (component === 'terminal') {
+      return <TerminalPanel
+        workspacePath={workspace?.path}
+        commandDraft={terminalCommandDraft}
+        onCommandDraftConsumed={(command) => {
+          setTerminalCommandDraft((current) => terminalDraftAfterConsume(current, command))
         }}
       />
     }
@@ -3621,7 +3799,7 @@ export default function App() {
           factory={dockFactory}
           realtimeResize
           onModelChange={(nextModel) => {
-            localStorage.setItem(DOCK_LAYOUT_STORAGE_KEY, JSON.stringify(nextModel.toJson()))
+            persistDockModel(nextModel)
             const selected = selectedRailComponent(nextModel)
             if (selected) setActiveRail(selected)
           }}

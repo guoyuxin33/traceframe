@@ -22,6 +22,10 @@ Checked items exist in the current development tree. Visible controls are not ma
 - [x] deterministic manual session compaction and scoped memory injection
 - [x] real-time output, trace, tool timing, usage, file-change, failure, and cancellation views
 - [x] streamed mock Responses tests covering delegation and post-budget synthesis
+- [x] real PTY terminal rooted in the authorized workspace, with streaming input/output and resize support
+- [x] local project process lifecycle, loopback preview loading, logs, and restart-and-refresh
+- [x] preview element selection with structured context appended to the active conversation draft
+- [x] explicit Preview-to-Terminal command staging without automatic execution
 
 ## Runtime hardening
 
@@ -52,6 +56,16 @@ Checked items exist in the current development tree. Visible controls are not ma
 - [ ] model-generated short-term summaries with provenance
 - [ ] semantic long-term retrieval with provenance and deletion controls
 - [ ] explicit memory conflict and supersession handling
+
+## Preview and deployment
+
+- [x] start, stop, and atomically restart a local development server
+- [x] sandboxed loopback preview with redirect validation and bounded HTML loading
+- [x] select a rendered element and send its inspectable context to the conversation composer
+- [ ] detect framework-specific development commands and ports
+- [ ] stream live reload state and build diagnostics into Preview
+- [ ] add deployment provider adapters with explicit confirmation, progress, logs, and hosted URL capture
+- [ ] keep per-workspace preview and deployment profiles
 
 ## Distribution
 

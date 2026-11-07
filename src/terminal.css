@@ -1,0 +1,172 @@
+@import '@xterm/xterm/css/xterm.css';
+
+.terminal-panel {
+  display: grid;
+  grid-template-rows: 34px minmax(0, 1fr) 22px;
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  min-height: 160px;
+  overflow: hidden;
+  container-type: inline-size;
+  background: var(--code-surface-deep, #0a0c0d);
+  color: var(--code-text, #c4cec9);
+}
+
+.terminal-toolbar,
+.terminal-footer {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  border-color: var(--line, rgba(237, 241, 239, 0.08));
+  background: var(--surface-panel, #141719);
+}
+
+.terminal-toolbar {
+  justify-content: space-between;
+  padding: 0 6px 0 10px;
+  border-bottom: 1px solid var(--line, rgba(237, 241, 239, 0.08));
+  gap: 8px;
+}
+
+.terminal-identity,
+.terminal-actions {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 6px;
+}
+
+.terminal-identity > svg { flex: 0 0 auto; color: var(--text-muted, #747e79); }
+
+.terminal-identity strong {
+  overflow: hidden;
+  color: var(--text-secondary, #a6aeaa);
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-status {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  color: var(--text-muted, #747e79);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 9px;
+  gap: 4px;
+}
+
+.terminal-status::before {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  content: '';
+}
+
+.terminal-status--running { color: var(--positive, #55c893); }
+.terminal-status--error { color: var(--negative, #dd7379); }
+.terminal-status--starting { color: var(--amber, #d3ad62); }
+.terminal-status--starting::before { display: none; }
+.terminal-status--starting svg { animation: terminal-spin 0.9s linear infinite; }
+
+.terminal-actions { flex: 0 0 auto; }
+
+.terminal-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted, #747e79);
+  cursor: pointer;
+  gap: 5px;
+}
+
+.terminal-actions button:hover:not(:disabled) {
+  background: var(--surface-hover, #202528);
+  color: var(--text, #edf1ef);
+}
+
+.terminal-actions button:disabled { cursor: default; opacity: 0.42; }
+
+.terminal-actions .terminal-draft-action {
+  width: auto;
+  max-width: 132px;
+  padding: 0 7px;
+  border: 1px solid var(--line, rgba(237, 241, 239, 0.08));
+  color: var(--text-secondary, #a6aeaa);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.terminal-host {
+  min-width: 0;
+  min-height: 0;
+  padding: 7px 4px 2px 9px;
+  overflow: hidden;
+}
+
+.terminal-host .xterm { height: 100%; }
+.terminal-host .xterm-viewport { scrollbar-color: var(--code-muted, #75807a) transparent; }
+
+.terminal-footer {
+  justify-content: space-between;
+  padding: 0 8px;
+  border-top: 1px solid var(--line, rgba(237, 241, 239, 0.08));
+  color: var(--text-muted, #747e79);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 9px;
+  gap: 12px;
+}
+
+.terminal-footer span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-footer span:last-child { text-align: right; }
+
+.terminal-panel--unavailable {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  padding: 24px;
+  background: var(--surface-panel, #141719);
+  color: var(--text-muted, #747e79);
+  text-align: center;
+  gap: 7px;
+}
+
+.terminal-panel--unavailable strong {
+  color: var(--text-secondary, #a6aeaa);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.terminal-panel--unavailable span { max-width: 300px; font-size: 11px; line-height: 16px; }
+
+@container (max-width: 420px) {
+  .terminal-toolbar { gap: 4px; padding-left: 6px; }
+  .terminal-identity,
+  .terminal-actions { gap: 3px; }
+  .terminal-actions .terminal-draft-action {
+    width: 26px;
+    padding: 0;
+  }
+  .terminal-draft-action span { display: none; }
+}
+
+@keyframes terminal-spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .terminal-status--starting svg { animation: none; }
+}
