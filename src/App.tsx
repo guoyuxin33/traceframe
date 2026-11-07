@@ -30,6 +30,7 @@ import {
   GitCompareArrows,
   GitCommitHorizontal,
   GitFork,
+  GripVertical,
   HardDrive,
   KeyRound,
   Layers3,
@@ -3852,6 +3853,10 @@ export default function App() {
           model={dockModel}
           factory={dockFactory}
           realtimeResize
+          tabDragSpeed={0.12}
+          onRenderTab={(_, renderValues) => {
+            renderValues.leading = <span className="dock-tab-grip" title="Drag to dock"><GripVertical size={12} aria-hidden="true" /></span>
+          }}
           onModelChange={(nextModel) => {
             persistDockModel(nextModel)
             setHiddenPanels(hiddenDockComponents(nextModel))

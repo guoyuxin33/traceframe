@@ -40,7 +40,7 @@ The OpenAI settings list the current general-purpose text and code models from t
 
 ## Workspace
 
-Every main surface is a dock tab and can be rearranged, resized, or closed. A closed panel appears in the left activity rail and returns to the tabset where the user last placed it, including after restart; older layouts fall back to its functional group. Code, diff, and output surfaces adapt to narrow dock widths without forcing the surrounding layout wider. Layouts persist locally and can be reset to the selected balanced, code, or conversation preset from Appearance settings.
+Every main surface is a dock tab and can be rearranged, resized, or closed. Dragging a tab to the center of another group joins it; dropping on the top, right, bottom, or left edge creates a new split. Closing the final tab in a region removes that empty region immediately so adjacent panels reclaim the space. A closed panel appears in the left activity rail and returns to its last live tabset or functional group, including after restart. Code, diff, and output surfaces adapt to narrow dock widths without forcing the surrounding layout wider. Layouts persist locally and can be reset to the selected balanced, code, or conversation preset from Appearance settings.
 
 | Area | Current behavior |
 | --- | --- |

@@ -44,7 +44,7 @@ import {
 import type { Provider, Session } from './types'
 import type { RuntimeEventRecord } from './types'
 import type { GitGraphSnapshot } from './features/git-graph'
-import { DOCK_COMPONENTS, hiddenDockComponents, persistDockModel, showOrRestoreDockComponent } from './features/workspace-layout/dockModel'
+import { DOCK_COMPONENTS, hiddenDockComponents, persistDockModel, pruneEmptyDockTabsets, showOrRestoreDockComponent } from './features/workspace-layout/dockModel'
 import { McpApproval } from './features/integrations'
 
 const sessions: Session[] = [
@@ -154,19 +154,11 @@ describe('dock layout schema migration', () => {
     expect(reloaded.getNodeById('preview')?.getParent()?.getId()).toBe(targetId)
   })
 
-  it('reuses an empty remembered tabset and falls back if that tabset is later removed', () => {
+  it('reclaims an empty remembered tabset and restores the panel into a live tabset', () => {
     const model = storedDockModel('balanced')
     const conversationTabsetId = model.getNodeById('conversation')!.getParent()!.getId()
     persistDockModel(model)
     model.doAction(Actions.deleteTab('conversation'))
-    persistDockModel(model)
-    expect(model.getNodeById(conversationTabsetId)).toBeTruthy()
-
-    showOrRestoreDockComponent(model, 'conversation')
-    expect(model.getNodeById('conversation')?.getParent()?.getId()).toBe(conversationTabsetId)
-
-    model.doAction(Actions.deleteTab('conversation'))
-    model.doAction(Actions.deleteTabset(conversationTabsetId))
     persistDockModel(model)
     expect(model.getNodeById(conversationTabsetId)).toBeUndefined()
 
@@ -177,7 +169,55 @@ describe('dock layout schema migration', () => {
 
   it('enables tab dragging, closing, and splitter resizing in every preset', () => {
     const layout = dockLayoutJson('balanced')
-    expect(layout.global).toMatchObject({ tabEnableClose: true, tabEnableDrag: true })
+    expect(layout.global).toMatchObject({
+      tabEnableClose: true,
+      tabEnableDrag: true,
+      tabSetEnableClose: true,
+      tabSetEnableDeleteWhenEmpty: true,
+      tabSetEnableDivide: true,
+      tabSetEnableDrag: true,
+      tabSetEnableDrop: true,
+      enableEdgeDock: true,
+    })
+  })
+
+  it('moves panels into an existing group or creates a new split on any edge', () => {
+    const model = storedDockModel('balanced')
+    const sessionsTabset = model.getNodeById('sessions')!.getParent()!
+
+    model.doAction(Actions.moveNode('preview', sessionsTabset.getId(), DockLocation.CENTER, -1, true))
+    expect(model.getNodeById('preview')?.getParent()?.getId()).toBe(sessionsTabset.getId())
+
+    for (const location of [DockLocation.LEFT, DockLocation.RIGHT, DockLocation.TOP, DockLocation.BOTTOM]) {
+      const target = model.getNodeById('conversation')!.getParent()!
+      model.doAction(Actions.moveNode('preview', target.getId(), location, -1, true))
+      expect(model.getNodeById('preview')?.getParent()?.getId()).not.toBe(target.getId())
+      expect(model.getNodeById('preview')?.getParent()?.getChildren()).toHaveLength(1)
+    }
+  })
+
+  it('removes empty tabsets left by v7 layouts while preserving minimized panels', () => {
+    const legacy = legacyDockLayout(new Set(['context', 'agents', 'memory']))
+    ;(legacy.global as { tabSetEnableClose?: boolean }).tabSetEnableClose = false
+    localStorage.setItem(DOCK_LAYOUT_STORAGE_KEY, JSON.stringify({ schemaVersion: 7, model: legacy }))
+
+    const model = storedDockModel('balanced')
+    const tabsets: Array<{ empty: boolean }> = []
+    model.visitNodes((node) => {
+      if (node.getType() === 'tabset') tabsets.push({ empty: node.getChildren().length === 0 })
+    })
+    expect(tabsets.some((tabset) => tabset.empty)).toBe(false)
+    expect(hiddenDockComponents(model)).toEqual(expect.arrayContaining(['context', 'agents', 'memory']))
+    expect((model.toJson().global as { tabSetEnableClose?: boolean }).tabSetEnableClose).not.toBe(false)
+  })
+
+  it('keeps one recoverable target when every panel is minimized', () => {
+    const model = storedDockModel('balanced')
+    DOCK_COMPONENTS.forEach((component) => model.doAction(Actions.deleteTab(component)))
+    pruneEmptyDockTabsets(model)
+    const tabsets: number[] = []
+    model.visitNodes((node) => { if (node.getType() === 'tabset') tabsets.push(node.getChildren().length) })
+    expect(tabsets).toEqual([0])
   })
 
   it('can restore a panel after every panel was minimized and the layout reloaded', () => {

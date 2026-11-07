@@ -50,6 +50,7 @@ This project has no tagged public release yet. The current package version is `0
 
 ### Fixed
 
+- Empty dock regions left behind after closing their final panel are removed immediately; adjacent panels reclaim the space, v7 layouts are repaired on load, and restored panels fall back to a live functional group.
 - Opening the native workspace picker no longer blocks the Tauri event loop; the dialog is asynchronous, parented to the application window, visibly pending, and guarded against duplicate opens.
 - Cancelling the picker or selecting a non-Git directory preserves the last successfully loaded workspace, and invalid directories are not saved as recent workspaces.
 - Manual file navigation and unsaved editor drafts no longer lose races with pending agent-follow refreshes.

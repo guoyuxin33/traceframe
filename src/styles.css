@@ -213,6 +213,9 @@ button:active {
   --flexlayout-font-family: 'IBM Plex Sans', sans-serif;
   --flexlayout-font-size: 11px;
   --flexlayout-splitter-size: 6px;
+  --flexlayout-splitter-active-size: 12px;
+  --flexlayout-splitter-handle-visibility: visible;
+  --flexlayout-color-splitter-handle: var(--text-muted);
   position: relative;
   grid-area: workspace;
   min-width: 0;
@@ -229,7 +232,28 @@ button:active {
 .dock-workspace .flexlayout__tab_button {
   height: 32px;
   border-radius: 0;
+  cursor: grab;
   font-weight: 400;
+}
+
+.dock-workspace .flexlayout__tab_button:active { cursor: grabbing; }
+
+.dock-tab-grip {
+  display: grid;
+  place-items: center;
+  width: 12px;
+  height: 20px;
+  color: var(--text-muted);
+  opacity: 0.52;
+}
+
+.dock-workspace .flexlayout__tab_button:hover .dock-tab-grip,
+.dock-workspace .flexlayout__tab_button--selected .dock-tab-grip { opacity: 0.9; }
+
+.dock-workspace .flexlayout__outline_rect,
+.dock-workspace .flexlayout__outline_rect_edge {
+  border-radius: 2px;
+  transition: transform 120ms var(--ease), opacity 120ms var(--ease);
 }
 
 .dock-workspace .flexlayout__tab_button--selected {

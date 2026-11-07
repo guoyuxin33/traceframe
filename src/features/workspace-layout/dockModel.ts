@@ -3,7 +3,7 @@ import { Actions, DockLocation, Model, type IJsonModel, type TabNode } from 'fle
 export type DockPreset = 'balanced' | 'code' | 'conversation'
 
 export const DOCK_LAYOUT_STORAGE_KEY = 'traceframe.dock-layout'
-export const DOCK_LAYOUT_SCHEMA_VERSION = 7
+export const DOCK_LAYOUT_SCHEMA_VERSION = 8
 export const DOCK_COMPONENTS = ['sessions', 'source', 'conversation', 'code', 'diff', 'preview', 'terminal', 'output', 'trace', 'context', 'agents', 'memory'] as const
 export type DockComponent = typeof DOCK_COMPONENTS[number]
 export type RailComponent = Extract<DockComponent, 'sessions' | 'source' | 'agents' | 'memory'>
@@ -37,7 +37,14 @@ export function dockLayoutJson(preset: DockPreset): IJsonModel {
       tabEnableClose: true,
       tabEnableDrag: true,
       tabEnableFloat: false,
-      tabSetEnableClose: false,
+      tabSetEnableClose: true,
+      tabSetEnableCloseButton: false,
+      tabSetEnableDeleteWhenEmpty: true,
+      tabSetEnableDivide: true,
+      tabSetEnableDrag: true,
+      tabSetEnableDrop: true,
+      enableEdgeDock: true,
+      enableEdgeDockIndicators: true,
     },
     borders: [],
     layout: {
@@ -83,7 +90,14 @@ function withCurrentDockCapabilities(value: IJsonModel) {
     tabEnableClose: true,
     tabEnableDrag: true,
     tabEnableFloat: false,
-    tabSetEnableClose: false,
+    tabSetEnableClose: true,
+    tabSetEnableCloseButton: false,
+    tabSetEnableDeleteWhenEmpty: true,
+    tabSetEnableDivide: true,
+    tabSetEnableDrag: true,
+    tabSetEnableDrop: true,
+    enableEdgeDock: true,
+    enableEdgeDockIndicators: true,
   }
   return current
 }
@@ -176,8 +190,12 @@ function decodedDockLayout(raw: string): { kind: 'valid'; model: IJsonModel; res
           ? { kind: 'valid', model: withCurrentDockCapabilities(stored.model), restoreLocations: sanitizedRestoreLocations(stored.restoreLocations) }
           : { kind: 'invalid' }
       }
-      if (stored.schemaVersion === 6 && isRestorableDockLayout(stored.model)) {
-        return { kind: 'valid', model: withCurrentDockCapabilities(stored.model), restoreLocations: {} }
+      if (stored.schemaVersion! >= 6 && isRestorableDockLayout(stored.model)) {
+        return {
+          kind: 'valid',
+          model: withCurrentDockCapabilities(stored.model),
+          restoreLocations: sanitizedRestoreLocations(stored.restoreLocations),
+        }
       }
       const migrated = migrateDockLayout(stored.model)
       return migrated ? { kind: 'valid', model: migrated, restoreLocations: {} } : { kind: 'invalid' }
@@ -207,11 +225,28 @@ export function persistDockModel(model: Model) {
   }
 }
 
+export function pruneEmptyDockTabsets(model: Model) {
+  const tabsets: Array<{ id: string; empty: boolean }> = []
+  model.visitNodes((node) => {
+    if (node.getType() === 'tabset') tabsets.push({ id: node.getId(), empty: node.getChildren().length === 0 })
+  })
+  const empty = tabsets.filter((tabset) => tabset.empty)
+  const keepId = empty.length === tabsets.length ? empty[0]?.id : undefined
+  empty.forEach((tabset) => {
+    if (tabset.id !== keepId) model.doAction(Actions.deleteTabset(tabset.id))
+  })
+}
+
+function restoredDockModel(value: IJsonModel, restoreLocations: DockRestoreLocations = {}) {
+  const model = Model.fromJson(value)
+  pruneEmptyDockTabsets(model)
+  rememberVisibleDockLocations(model, restoreLocations)
+  return model
+}
+
 export function storedDockModel(preset: DockPreset) {
   const fallback = () => {
-    const model = Model.fromJson(dockLayoutJson(preset))
-    rememberVisibleDockLocations(model)
-    return model
+    return restoredDockModel(dockLayoutJson(preset))
   }
   let current: string | null = null
   try {
@@ -224,8 +259,7 @@ export function storedDockModel(preset: DockPreset) {
     if (decoded.kind === 'future') return fallback()
     if (decoded.kind === 'valid') {
       try {
-        const model = Model.fromJson(decoded.model)
-        rememberVisibleDockLocations(model, decoded.restoreLocations)
+        const model = restoredDockModel(decoded.model, decoded.restoreLocations)
         persistDockModel(model)
         return model
       } catch {
@@ -245,8 +279,7 @@ export function storedDockModel(preset: DockPreset) {
     const decoded = decodedDockLayout(raw)
     if (decoded.kind !== 'valid') continue
     try {
-      const model = Model.fromJson(decoded.model)
-      rememberVisibleDockLocations(model, decoded.restoreLocations)
+      const model = restoredDockModel(decoded.model, decoded.restoreLocations)
       persistDockModel(model)
       return model
     } catch {
