@@ -1,3 +1,8 @@
+use crate::runtime::approvals::{
+    aggregate_status, ApprovalAuditRecord, ApprovalBatchRecord, ApprovalBatchStatus,
+    ApprovalDecision, ApprovalFileRecord, ApprovalFileStatus, FileVersion, PermissionMode,
+    PreparedApprovalFile,
+};
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -234,7 +239,48 @@ impl AppStore {
                    payload TEXT NOT NULL,
                    created_at INTEGER NOT NULL
                  );
-                 CREATE INDEX IF NOT EXISTS runtime_events_session_time ON runtime_events(session_id, created_at);",
+                 CREATE INDEX IF NOT EXISTS runtime_events_session_time ON runtime_events(session_id, created_at);
+                 CREATE TABLE IF NOT EXISTS approval_batches (
+                   id TEXT PRIMARY KEY,
+                   session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                   run_id TEXT NOT NULL,
+                   workspace_path TEXT NOT NULL,
+                   permission_mode TEXT NOT NULL,
+                   status TEXT NOT NULL,
+                   created_at INTEGER NOT NULL,
+                   resolved_at INTEGER
+                 );
+                 CREATE INDEX IF NOT EXISTS approval_batches_session_time ON approval_batches(session_id, created_at);
+                 CREATE TABLE IF NOT EXISTS approval_files (
+                   id TEXT PRIMARY KEY,
+                   batch_id TEXT NOT NULL REFERENCES approval_batches(id) ON DELETE CASCADE,
+                   path TEXT NOT NULL,
+                   status TEXT NOT NULL,
+                   diff TEXT NOT NULL,
+                   start_line INTEGER NOT NULL,
+                   end_line INTEGER NOT NULL,
+                   before_exists INTEGER NOT NULL,
+                   before_content BLOB NOT NULL,
+                   before_mode INTEGER,
+                   after_exists INTEGER NOT NULL,
+                   after_content BLOB NOT NULL,
+                   after_mode INTEGER,
+                   decided_at INTEGER,
+                   decision_reason TEXT NOT NULL DEFAULT '',
+                   UNIQUE(batch_id, path)
+                 );
+                 CREATE INDEX IF NOT EXISTS approval_files_batch_path ON approval_files(batch_id, path);
+                 CREATE TABLE IF NOT EXISTS approval_audit (
+                   id TEXT PRIMARY KEY,
+                   batch_id TEXT NOT NULL REFERENCES approval_batches(id) ON DELETE CASCADE,
+                   file_id TEXT NOT NULL REFERENCES approval_files(id) ON DELETE CASCADE,
+                   path TEXT NOT NULL,
+                   decision TEXT NOT NULL,
+                   reason TEXT NOT NULL DEFAULT '',
+                   actor TEXT NOT NULL,
+                   created_at INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS approval_audit_batch_time ON approval_audit(batch_id, created_at);",
             )
             .map_err(|error| format!("Application store could not be migrated: {error}"))?;
             ensure_session_context_columns(connection)?;
@@ -569,6 +615,233 @@ impl AppStore {
         })
     }
 
+    pub fn create_approval_batch_record(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        workspace_path: &str,
+        permission_mode: PermissionMode,
+        files: Vec<PreparedApprovalFile>,
+        auto_accept: bool,
+    ) -> Result<ApprovalBatchRecord, String> {
+        let timestamp = now_millis();
+        let batch_id = new_id("approval");
+        let file_status = if auto_accept {
+            ApprovalFileStatus::Accepted
+        } else {
+            ApprovalFileStatus::Pending
+        };
+        let status = if auto_accept || files.is_empty() {
+            ApprovalBatchStatus::Accepted
+        } else {
+            ApprovalBatchStatus::Pending
+        };
+        let resolved_at = (status != ApprovalBatchStatus::Pending).then_some(timestamp);
+        let records = files
+            .into_iter()
+            .map(|file| ApprovalFileRecord {
+                id: new_id("approval-file"),
+                batch_id: batch_id.clone(),
+                path: file.path,
+                status: file_status,
+                diff: file.diff,
+                start_line: file.start_line,
+                end_line: file.end_line,
+                before: file.before,
+                after: file.after,
+                decided_at: auto_accept.then_some(timestamp),
+                decision_reason: if auto_accept {
+                    "Full access mode".into()
+                } else {
+                    String::new()
+                },
+            })
+            .collect::<Vec<_>>();
+        self.with_connection(|connection| {
+            let transaction = connection.unchecked_transaction().map_err(|error| {
+                format!("Approval transaction could not be started: {error}")
+            })?;
+            transaction
+                .execute(
+                    "INSERT INTO approval_batches (id, session_id, run_id, workspace_path, permission_mode, status, created_at, resolved_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        batch_id,
+                        session_id,
+                        run_id,
+                        workspace_path,
+                        permission_mode.as_str(),
+                        status.as_str(),
+                        timestamp,
+                        resolved_at,
+                    ],
+                )
+                .map_err(|error| format!("Approval batch could not be saved: {error}"))?;
+            for file in &records {
+                transaction
+                    .execute(
+                        "INSERT INTO approval_files (
+                           id, batch_id, path, status, diff, start_line, end_line,
+                           before_exists, before_content, before_mode,
+                           after_exists, after_content, after_mode, decided_at, decision_reason
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                        params![
+                            file.id,
+                            file.batch_id,
+                            file.path,
+                            file.status.as_str(),
+                            file.diff,
+                            file.start_line as u64,
+                            file.end_line as u64,
+                            file.before.exists as i64,
+                            file.before.content,
+                            file.before.unix_mode.map(i64::from),
+                            file.after.exists as i64,
+                            file.after.content,
+                            file.after.unix_mode.map(i64::from),
+                            file.decided_at,
+                            file.decision_reason,
+                        ],
+                    )
+                    .map_err(|error| format!("Approval file could not be saved: {error}"))?;
+                if auto_accept {
+                    transaction
+                        .execute(
+                            "INSERT INTO approval_audit (id, batch_id, file_id, path, decision, reason, actor, created_at)
+                             VALUES (?1, ?2, ?3, ?4, 'accept', 'Full access mode', 'policy', ?5)",
+                            params![
+                                new_id("approval-audit"),
+                                file.batch_id,
+                                file.id,
+                                file.path,
+                                timestamp,
+                            ],
+                        )
+                        .map_err(|error| format!("Approval audit could not be saved: {error}"))?;
+                }
+            }
+            transaction
+                .commit()
+                .map_err(|error| format!("Approval batch could not be committed: {error}"))?;
+            self.approval_batch_record(&batch_id)
+        })
+    }
+
+    pub fn approval_batch_record(&self, batch_id: &str) -> Result<ApprovalBatchRecord, String> {
+        self.with_connection(|connection| query_approval_batch(connection, batch_id))
+    }
+
+    pub fn session_approval_batches(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ApprovalBatchRecord>, String> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id FROM approval_batches WHERE session_id = ?1 ORDER BY created_at DESC, rowid DESC",
+                )
+                .map_err(|error| format!("Approval batches could not be queried: {error}"))?;
+            let ids = statement
+                .query_map([session_id], |row| row.get::<_, String>(0))
+                .map_err(|error| format!("Approval batches could not be read: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("Approval batches could not be decoded: {error}"))?;
+            ids.into_iter()
+                .map(|id| query_approval_batch(connection, &id))
+                .collect()
+        })
+    }
+
+    pub fn record_approval_decision(
+        &self,
+        batch_id: &str,
+        paths: Option<&[String]>,
+        decision: ApprovalDecision,
+        reason: &str,
+        actor: &str,
+    ) -> Result<ApprovalBatchRecord, String> {
+        let reason = reason.trim();
+        let actor = actor.trim();
+        if actor.is_empty() {
+            return Err("Approval actor is required".into());
+        }
+        self.with_connection(|connection| {
+            let transaction = connection.unchecked_transaction().map_err(|error| {
+                format!("Approval decision transaction could not be started: {error}")
+            })?;
+            let mut batch = query_approval_batch(&transaction, batch_id)?;
+            let selected = paths.map(|paths| paths.iter().collect::<std::collections::HashSet<_>>());
+            let targets = batch
+                .files
+                .iter_mut()
+                .filter(|file| {
+                    selected
+                        .as_ref()
+                        .is_none_or(|paths| paths.contains(&file.path))
+                })
+                .collect::<Vec<_>>();
+            if targets.is_empty() {
+                return Err("No approval files matched the decision".into());
+            }
+            if targets
+                .iter()
+                .any(|file| file.status != ApprovalFileStatus::Pending)
+            {
+                return Err("One or more approval files have already been decided".into());
+            }
+            let timestamp = now_millis();
+            for file in targets {
+                let updated = transaction
+                    .execute(
+                        "UPDATE approval_files
+                         SET status = ?2, decided_at = ?3, decision_reason = ?4
+                         WHERE id = ?1 AND status = 'pending'",
+                        params![
+                            file.id,
+                            decision.file_status().as_str(),
+                            timestamp,
+                            reason,
+                        ],
+                    )
+                    .map_err(|error| format!("Approval file decision could not be saved: {error}"))?;
+                if updated != 1 {
+                    return Err(format!("Approval file '{}' is no longer pending", file.path));
+                }
+                transaction
+                    .execute(
+                        "INSERT INTO approval_audit (id, batch_id, file_id, path, decision, reason, actor, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![
+                            new_id("approval-audit"),
+                            batch_id,
+                            file.id,
+                            file.path,
+                            decision.as_str(),
+                            reason,
+                            actor,
+                            timestamp,
+                        ],
+                    )
+                    .map_err(|error| format!("Approval audit could not be saved: {error}"))?;
+                file.status = decision.file_status();
+                file.decided_at = Some(timestamp);
+                file.decision_reason = reason.to_owned();
+            }
+            let status = aggregate_status(&batch.files);
+            let resolved_at = (status != ApprovalBatchStatus::Pending).then_some(timestamp);
+            transaction
+                .execute(
+                    "UPDATE approval_batches SET status = ?2, resolved_at = ?3 WHERE id = ?1",
+                    params![batch_id, status.as_str(), resolved_at],
+                )
+                .map_err(|error| format!("Approval batch status could not be saved: {error}"))?;
+            transaction
+                .commit()
+                .map_err(|error| format!("Approval decision could not be committed: {error}"))?;
+            self.approval_batch_record(batch_id)
+        })
+    }
+
     pub fn context_messages(
         &self,
         session_id: &str,
@@ -780,6 +1053,157 @@ fn map_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecord> {
     })
 }
 
+fn query_approval_batch(
+    connection: &Connection,
+    batch_id: &str,
+) -> Result<ApprovalBatchRecord, String> {
+    let raw = connection
+        .query_row(
+            "SELECT id, session_id, run_id, workspace_path, permission_mode, status, created_at, resolved_at
+             FROM approval_batches WHERE id = ?1",
+            [batch_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, u64>(6)?,
+                    row.get::<_, Option<u64>>(7)?,
+                ))
+            },
+        )
+        .map_err(|error| format!("Approval batch could not be found: {error}"))?;
+    let mut files_statement = connection
+        .prepare(
+            "SELECT id, batch_id, path, status, diff, start_line, end_line,
+                    before_exists, before_content, before_mode,
+                    after_exists, after_content, after_mode, decided_at, decision_reason
+             FROM approval_files WHERE batch_id = ?1 ORDER BY path ASC, rowid ASC",
+        )
+        .map_err(|error| format!("Approval files could not be queried: {error}"))?;
+    let raw_files = files_statement
+        .query_map([batch_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, u64>(5)?,
+                row.get::<_, u64>(6)?,
+                row.get::<_, bool>(7)?,
+                row.get::<_, Vec<u8>>(8)?,
+                row.get::<_, Option<u32>>(9)?,
+                row.get::<_, bool>(10)?,
+                row.get::<_, Vec<u8>>(11)?,
+                row.get::<_, Option<u32>>(12)?,
+                row.get::<_, Option<u64>>(13)?,
+                row.get::<_, String>(14)?,
+            ))
+        })
+        .map_err(|error| format!("Approval files could not be read: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Approval files could not be decoded: {error}"))?;
+    let files = raw_files
+        .into_iter()
+        .map(
+            |(
+                id,
+                batch_id,
+                path,
+                status,
+                diff,
+                start_line,
+                end_line,
+                before_exists,
+                before_content,
+                before_mode,
+                after_exists,
+                after_content,
+                after_mode,
+                decided_at,
+                decision_reason,
+            )| {
+                Ok(ApprovalFileRecord {
+                    id,
+                    batch_id,
+                    path,
+                    status: ApprovalFileStatus::parse(&status)?,
+                    diff,
+                    start_line: start_line as usize,
+                    end_line: end_line as usize,
+                    before: FileVersion {
+                        exists: before_exists,
+                        content: before_content,
+                        unix_mode: before_mode,
+                    },
+                    after: FileVersion {
+                        exists: after_exists,
+                        content: after_content,
+                        unix_mode: after_mode,
+                    },
+                    decided_at,
+                    decision_reason,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut audit_statement = connection
+        .prepare(
+            "SELECT id, batch_id, file_id, path, decision, reason, actor, created_at
+             FROM approval_audit WHERE batch_id = ?1 ORDER BY created_at ASC, rowid ASC",
+        )
+        .map_err(|error| format!("Approval audit could not be queried: {error}"))?;
+    let raw_decisions = audit_statement
+        .query_map([batch_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, u64>(7)?,
+            ))
+        })
+        .map_err(|error| format!("Approval audit could not be read: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Approval audit could not be decoded: {error}"))?;
+    let decisions = raw_decisions
+        .into_iter()
+        .map(
+            |(id, batch_id, file_id, path, decision, reason, actor, created_at)| {
+                Ok(ApprovalAuditRecord {
+                    id,
+                    batch_id,
+                    file_id,
+                    path,
+                    decision: ApprovalDecision::parse(&decision)?,
+                    reason,
+                    actor,
+                    created_at,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(ApprovalBatchRecord {
+        id: raw.0,
+        session_id: raw.1,
+        run_id: raw.2,
+        workspace_path: raw.3,
+        permission_mode: PermissionMode::parse(&raw.4)?,
+        status: ApprovalBatchStatus::parse(&raw.5)?,
+        files,
+        decisions,
+        created_at: raw.6,
+        resolved_at: raw.7,
+    })
+}
+
 fn query_sessions(connection: &Connection) -> Result<Vec<SessionRecord>, String> {
     let mut statement = connection.prepare(
         "SELECT id, title, summary, context_summary, compacted_message_count, branch, workspace_path, archived, created_at, updated_at FROM sessions ORDER BY updated_at DESC",
@@ -955,8 +1379,92 @@ pub fn compact_session(session_id: String, store: State<'_, AppStore>) -> Result
 #[cfg(test)]
 mod tests {
     use super::{query_events, query_session_events, AppStore, NewMemory, NewMessage};
+    use crate::runtime::approvals::{
+        ApprovalBatchStatus, ApprovalDecision, FileVersion, PermissionMode, PreparedApprovalFile,
+    };
     use rusqlite::Connection;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn approval_batches_persist_per_file_decisions_and_append_only_audit() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("traceframe-approval-store-{nonce}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = AppStore::default();
+        store.initialize(root.join("traceframe.sqlite3")).unwrap();
+        let session = store
+            .create_session_record(
+                "Approval test".into(),
+                "main".into(),
+                root.to_string_lossy().into(),
+            )
+            .unwrap();
+        let version = |content: &str| FileVersion {
+            exists: true,
+            content: content.as_bytes().to_vec(),
+            unix_mode: Some(0o100644),
+        };
+        let files = ["one.ts", "two.ts"]
+            .into_iter()
+            .map(|path| PreparedApprovalFile {
+                path: path.into(),
+                diff: format!("--- a/{path}\n+++ b/{path}\n"),
+                start_line: 1,
+                end_line: 1,
+                before: version("before\n"),
+                after: version("after\n"),
+            })
+            .collect();
+        let batch = store
+            .create_approval_batch_record(
+                &session.id,
+                "run-approval",
+                &root.to_string_lossy(),
+                PermissionMode::RequestApproval,
+                files,
+                false,
+            )
+            .unwrap();
+        assert_eq!(batch.status, ApprovalBatchStatus::Pending);
+        assert_eq!(batch.files.len(), 2);
+        assert!(batch.decisions.is_empty());
+
+        let first = store
+            .record_approval_decision(
+                &batch.id,
+                Some(&["one.ts".into()]),
+                ApprovalDecision::Accept,
+                "Reviewed diff",
+                "user",
+            )
+            .unwrap();
+        assert_eq!(first.status, ApprovalBatchStatus::Pending);
+        assert_eq!(first.decisions.len(), 1);
+        assert_eq!(first.decisions[0].reason, "Reviewed diff");
+
+        let resolved = store
+            .record_approval_decision(
+                &batch.id,
+                Some(&["two.ts".into()]),
+                ApprovalDecision::Reject,
+                "Unwanted change",
+                "user",
+            )
+            .unwrap();
+        assert_eq!(resolved.status, ApprovalBatchStatus::PartiallyAccepted);
+        assert_eq!(resolved.decisions.len(), 2);
+        assert!(resolved.resolved_at.is_some());
+        assert_eq!(
+            store.session_approval_batches(&session.id).unwrap().len(),
+            1
+        );
+
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn session_event_query_recovers_traces_omitted_from_the_global_snapshot() {

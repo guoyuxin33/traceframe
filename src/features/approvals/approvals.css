@@ -1,0 +1,84 @@
+.permission-mode {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  gap: 6px;
+}
+
+.permission-mode legend {
+  margin-bottom: 5px;
+  color: var(--text-muted);
+  font-size: var(--font-meta);
+}
+
+.permission-mode label {
+  display: grid;
+  min-width: 0;
+  min-height: 42px;
+  padding: 7px 8px;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-panel);
+  color: var(--text-muted);
+  cursor: pointer;
+  grid-template-columns: 14px 16px minmax(0, 1fr);
+  gap: 7px;
+}
+
+.permission-mode label.is-active { border-color: var(--line-strong); background: var(--surface-raised); color: var(--text); }
+.permission-mode input { width: 13px; height: 13px; margin: 0; accent-color: var(--accent); }
+.permission-mode label > span { display: grid; min-width: 0; gap: 1px; }
+.permission-mode strong { color: inherit; font-size: 10px; font-weight: 500; }
+.permission-mode small { overflow: hidden; color: var(--text-muted); font-size: var(--font-meta); text-overflow: ellipsis; white-space: nowrap; }
+.permission-mode:disabled label { cursor: not-allowed; opacity: .55; }
+
+.approval-panel, .approval-review { display: grid; min-width: 0; gap: 8px; }
+.approval-batch { min-width: 0; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-panel); overflow: hidden; }
+.approval-batch.is-pending { border-color: var(--line-strong); }
+
+.approval-batch-header {
+  display: grid;
+  min-width: 0;
+  min-height: 44px;
+  padding: 7px 9px;
+  align-items: center;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  gap: 7px;
+}
+
+.approval-batch-mark { display: grid; width: 22px; height: 22px; place-items: center; border: 1px solid var(--line); border-radius: 4px; color: var(--text-muted); }
+.approval-batch.is-pending .approval-batch-mark { color: var(--amber); }
+.approval-batch-header > span:nth-child(2) { display: grid; min-width: 0; gap: 1px; }
+.approval-batch-header strong { overflow: hidden; color: var(--text); font-size: 11px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.approval-batch-header small { overflow: hidden; color: var(--text-muted); font: 9px/14px 'IBM Plex Mono', monospace; text-overflow: ellipsis; white-space: nowrap; }
+.approval-batch-header code { color: var(--text-secondary); font: 9px/14px 'IBM Plex Mono', monospace; }
+
+.approval-file { border-top: 1px solid var(--line); }
+.approval-file summary { display: grid; min-width: 0; min-height: 36px; padding: 5px 8px; align-items: center; color: var(--text-muted); cursor: pointer; grid-template-columns: 13px 14px minmax(0, 1fr) auto; gap: 6px; list-style: none; }
+.approval-file summary::-webkit-details-marker { display: none; }
+.approval-file summary:hover { background: var(--surface-raised); }
+.approval-file summary > span { display: grid; min-width: 0; gap: 1px; }
+.approval-file summary strong { overflow: hidden; color: var(--text-secondary); font: 10px/14px 'IBM Plex Mono', monospace; font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
+.approval-file summary small, .approval-file summary em { color: var(--text-muted); font: 9px/12px 'IBM Plex Mono', monospace; font-style: normal; }
+.approval-file.is-accepted summary em { color: var(--positive); }
+.approval-file.is-rejected summary em { color: var(--negative); }
+.approval-disclosure { transition: transform 120ms ease; }
+.approval-file[open] .approval-disclosure { transform: rotate(180deg); }
+
+.approval-diff { max-height: 310px; margin: 0; padding: 7px 0; overflow: auto; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--surface-deep); color: var(--text-muted); font: 10px/16px 'IBM Plex Mono', monospace; tab-size: 2; }
+.approval-diff span { display: block; min-width: max-content; padding: 0 10px; white-space: pre; }
+.approval-diff .is-added { background: color-mix(in srgb, var(--positive) 12%, transparent); color: var(--positive); }
+.approval-diff .is-removed { background: color-mix(in srgb, var(--negative) 11%, transparent); color: var(--negative); }
+.approval-diff .is-hunk { color: var(--accent); }
+
+.approval-file-actions, .approval-batch-actions { display: flex; padding: 7px 8px; justify-content: flex-end; gap: 6px; }
+.approval-batch-actions { border-top: 1px solid var(--line); background: var(--surface-deep); }
+.approval-file-actions button, .approval-batch-actions button { display: inline-flex; min-height: 27px; padding: 0 8px; align-items: center; border: 1px solid var(--line); border-radius: 4px; background: var(--surface-panel); color: var(--text-secondary); font-size: 10px; gap: 5px; }
+.approval-file-actions button.is-accept:hover:not(:disabled), .approval-batch-actions button.is-accept:hover:not(:disabled) { border-color: var(--positive); color: var(--positive); }
+.approval-file-actions button.is-reject:hover:not(:disabled), .approval-batch-actions button.is-reject:hover:not(:disabled) { border-color: var(--negative); color: var(--negative); }
+.approval-file-actions button:disabled, .approval-batch-actions button:disabled { cursor: wait; opacity: .5; }
+.approval-decision-note, .approval-error { margin: 0; padding: 8px; color: var(--text-muted); font-size: var(--font-meta); line-height: 16px; }
+.approval-error { border: 1px solid var(--negative); border-radius: 4px; color: var(--negative); }
+.approval-empty { display: flex; min-height: 64px; padding: 12px; align-items: center; justify-content: center; color: var(--text-muted); font-size: 10px; gap: 6px; }

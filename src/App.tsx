@@ -1,5 +1,5 @@
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Actions, Layout, Model, type IJsonModel, type TabNode } from 'flexlayout-react'
+import { FormEvent, Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { Layout, Model, type TabNode } from 'flexlayout-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import 'flexlayout-react/style/dark.css'
@@ -107,12 +107,48 @@ import {
 import type { RuntimeEventRecord } from './types'
 import { PreviewPanel } from './PreviewPanel'
 import { TerminalPanel } from './TerminalPanel'
+import { conversationTimeline } from './features/conversation/timeline'
+import { useConversationAutoscroll } from './features/conversation/useConversationAutoscroll'
+import { ApprovalReviewPanel, PermissionModeControl, type PermissionMode } from './features/approvals'
+import { GitGraphSection, type GitGraphSnapshot } from './features/git-graph'
+import {
+  IntegrationSettings,
+  McpApproval,
+  emptyIntegrationSettings,
+  loadIntegrationSettings,
+  persistIntegrationSettings,
+  type IntegrationSettingsValue,
+} from './features/integrations'
+import { HiddenPanelLibrary } from './features/workspace-layout/HiddenPanelLibrary'
+import {
+  DOCK_LAYOUT_SCHEMA_VERSION,
+  DOCK_LAYOUT_STORAGE_KEY,
+  dockLayoutJson,
+  hiddenDockComponents,
+  isValidDockLayout,
+  migrateDockLayout,
+  persistDockModel,
+  selectedRailComponent,
+  showOrRestoreDockComponent,
+  storedDockModel,
+  type DockComponent,
+  type RailComponent,
+} from './features/workspace-layout/dockModel'
+
+export {
+  DOCK_LAYOUT_SCHEMA_VERSION,
+  DOCK_LAYOUT_STORAGE_KEY,
+  dockLayoutJson,
+  isValidDockLayout,
+  migrateDockLayout,
+  storedDockModel,
+}
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
 
-type SettingsSection = 'models' | 'appearance'
+type SettingsSection = 'models' | 'integrations' | 'appearance'
 type EditorMode = 'view' | 'edit'
 
 export interface AgentEditTarget {
@@ -189,193 +225,6 @@ const defaultUiPreferences: UiPreferences = {
   theme: 'graphite',
   density: 'compact',
   layout: 'balanced',
-}
-
-export const DOCK_LAYOUT_STORAGE_KEY = 'traceframe.dock-layout'
-export const DOCK_LAYOUT_SCHEMA_VERSION = 5
-const LEGACY_DOCK_LAYOUT_STORAGE_KEYS = ['traceframe.dock-layout.v4', 'traceframe.dock-layout.v3', 'traceframe.dock-layout.v2'] as const
-const DOCK_COMPONENTS = ['sessions', 'source', 'conversation', 'code', 'diff', 'preview', 'terminal', 'output', 'trace', 'context', 'agents', 'memory'] as const
-type DockComponent = typeof DOCK_COMPONENTS[number]
-type RailComponent = Extract<DockComponent, 'sessions' | 'source' | 'agents' | 'memory'>
-
-function selectedRailComponent(model: Model, includeSelectedFallback = false): RailComponent | null {
-  const component = model.getActiveTabset()?.getSelectedNode()?.getComponent()
-  if (component === 'sessions' || component === 'source' || component === 'agents' || component === 'memory') return component
-  if (includeSelectedFallback) {
-    const selected = (['source', 'sessions', 'agents', 'memory'] as const)
-      .find((candidate) => (model.getNodeById(candidate) as TabNode | undefined)?.isSelected())
-    if (selected) return selected
-  }
-  return null
-}
-
-function dockTab(id: DockComponent, name: string) {
-  return { type: 'tab' as const, id, name, component: id }
-}
-
-export function dockLayoutJson(preset: UiPreferences['layout']): IJsonModel {
-  const weights = preset === 'code' ? [18, 20, 45, 17] : preset === 'conversation' ? [18, 38, 27, 17] : [18, 28, 37, 17]
-  const workspaceWeights = preset === 'code' ? [72, 28] : preset === 'conversation' ? [58, 42] : [66, 34]
-  return {
-    global: {
-      tabEnableClose: false,
-      tabEnableFloat: false,
-      tabSetEnableClose: false,
-    },
-    borders: [],
-    layout: {
-      type: 'row',
-      weight: 100,
-      children: [
-        { type: 'tabset', weight: weights[0], minWidth: 200, children: [dockTab('sessions', 'Sessions'), dockTab('source', 'Source')] },
-        { type: 'tabset', weight: weights[1], minWidth: 220, children: [dockTab('conversation', 'Conversation')] },
-        {
-          type: 'row',
-          weight: weights[2],
-          minWidth: 360,
-          children: [
-            { type: 'tabset', weight: workspaceWeights[0], minHeight: 240, children: [dockTab('code', 'Code'), dockTab('diff', 'Diff'), dockTab('preview', 'Preview')] },
-            { type: 'tabset', weight: workspaceWeights[1], minHeight: 160, children: [dockTab('terminal', 'Terminal'), dockTab('output', 'Output'), dockTab('trace', 'Trace')] },
-          ],
-        },
-        { type: 'tabset', weight: weights[3], minWidth: 220, children: [dockTab('context', 'Context'), dockTab('agents', 'Agents'), dockTab('memory', 'Memory')] },
-      ],
-    },
-  }
-}
-
-function collectDockComponents(node: unknown, result: string[] = []) {
-  if (!node || typeof node !== 'object') return result
-  const candidate = node as { component?: unknown; children?: unknown[] }
-  if (typeof candidate.component === 'string') result.push(candidate.component)
-  candidate.children?.forEach((child) => collectDockComponents(child, result))
-  return result
-}
-
-export function isValidDockLayout(value: IJsonModel) {
-  const components = collectDockComponents(value.layout).sort()
-  const required = [...DOCK_COMPONENTS].sort()
-  return components.length === required.length && components.every((component, index) => component === required[index])
-}
-
-interface MutableDockNode {
-  component?: string
-  children?: MutableDockNode[]
-}
-
-interface PersistedDockLayout {
-  schemaVersion: number
-  model: IJsonModel
-}
-
-function dockParentFor(node: MutableDockNode, components: Set<string>): MutableDockNode | null {
-  if (node.children?.some((child) => child.component && components.has(child.component))) return node
-  for (const child of node.children ?? []) {
-    const parent = dockParentFor(child, components)
-    if (parent) return parent
-  }
-  return null
-}
-
-export function migrateDockLayout(value: IJsonModel): IJsonModel | null {
-  if (isValidDockLayout(value)) return value
-  const components = collectDockComponents(value.layout)
-  const unique = new Set(components)
-  const required = new Set<string>(DOCK_COMPONENTS)
-  if (unique.size !== components.length || components.some((component) => !required.has(component))) return null
-  const missing = DOCK_COMPONENTS.filter((component) => !unique.has(component))
-  if (missing.some((component) => component !== 'preview' && component !== 'terminal')) return null
-
-  const migrated = JSON.parse(JSON.stringify(value)) as IJsonModel
-  const layout = migrated.layout as unknown as MutableDockNode
-  if (missing.includes('preview')) {
-    const workspaceParent = dockParentFor(layout, new Set(['code', 'diff']))
-    if (!workspaceParent?.children) return null
-    workspaceParent.children.push(dockTab('preview', 'Preview'))
-  }
-  if (missing.includes('terminal')) {
-    const outputParent = dockParentFor(layout, new Set(['output', 'trace']))
-    if (!outputParent?.children) return null
-    outputParent.children.unshift(dockTab('terminal', 'Terminal'))
-  }
-  return isValidDockLayout(migrated) ? migrated : null
-}
-
-function decodedDockLayout(raw: string): { kind: 'valid'; model: IJsonModel } | { kind: 'future' | 'invalid' } {
-  try {
-    const parsed = JSON.parse(raw) as Partial<PersistedDockLayout> | IJsonModel
-    if (typeof (parsed as Partial<PersistedDockLayout>).schemaVersion === 'number') {
-      const stored = parsed as Partial<PersistedDockLayout>
-      if (!Number.isSafeInteger(stored.schemaVersion) || !stored.model) return { kind: 'invalid' }
-      if (stored.schemaVersion! > DOCK_LAYOUT_SCHEMA_VERSION) return { kind: 'future' }
-      const migrated = migrateDockLayout(stored.model)
-      return migrated ? { kind: 'valid', model: migrated } : { kind: 'invalid' }
-    }
-    const migrated = migrateDockLayout(parsed as IJsonModel)
-    return migrated ? { kind: 'valid', model: migrated } : { kind: 'invalid' }
-  } catch {
-    return { kind: 'invalid' }
-  }
-}
-
-export function persistDockModel(model: Model) {
-  const stored: PersistedDockLayout = { schemaVersion: DOCK_LAYOUT_SCHEMA_VERSION, model: model.toJson() }
-  try {
-    const current = localStorage.getItem(DOCK_LAYOUT_STORAGE_KEY)
-    if (current) {
-      const parsed = JSON.parse(current) as Partial<PersistedDockLayout>
-      if (typeof parsed.schemaVersion === 'number' && parsed.schemaVersion > DOCK_LAYOUT_SCHEMA_VERSION) return
-    }
-    localStorage.setItem(DOCK_LAYOUT_STORAGE_KEY, JSON.stringify(stored))
-  } catch {
-    // A restricted webview can still use the in-memory model.
-  }
-}
-
-export function storedDockModel(preset: UiPreferences['layout']) {
-  const fallback = () => Model.fromJson(dockLayoutJson(preset))
-  let current: string | null = null
-  try {
-    current = localStorage.getItem(DOCK_LAYOUT_STORAGE_KEY)
-  } catch {
-    return fallback()
-  }
-  if (current) {
-    const decoded = decodedDockLayout(current)
-    if (decoded.kind === 'future') return fallback()
-    if (decoded.kind === 'valid') {
-      try {
-        const model = Model.fromJson(decoded.model)
-        persistDockModel(model)
-        return model
-      } catch {
-        // Continue through legacy layouts before resetting corrupt state.
-      }
-    }
-  }
-
-  for (const key of LEGACY_DOCK_LAYOUT_STORAGE_KEYS) {
-    let raw: string | null = null
-    try {
-      raw = localStorage.getItem(key)
-    } catch {
-      return fallback()
-    }
-    if (!raw) continue
-    const decoded = decodedDockLayout(raw)
-    if (decoded.kind !== 'valid') continue
-    try {
-      const model = Model.fromJson(decoded.model)
-      persistDockModel(model)
-      return model
-    } catch {
-      // Try the next known legacy schema.
-    }
-  }
-
-  const model = fallback()
-  persistDockModel(model)
-  return model
 }
 
 function loadStored<T>(key: string, fallback: T): T {
@@ -617,13 +466,17 @@ export function TopBar({
 export function AppRail({
   changeCount,
   active,
+  hiddenPanels = [],
   onShowSessions,
   onShowDock,
+  onResetLayout,
 }: {
   changeCount: number
   active?: RailComponent | null
+  hiddenPanels?: DockComponent[]
   onShowSessions: () => void
   onShowDock: (component: DockComponent) => void
+  onResetLayout?: () => void
 }) {
   return (
     <nav className="app-rail" aria-label="主导航">
@@ -635,8 +488,10 @@ export function AppRail({
         </div>
         <IconButton label="智能体拓扑" active={active === 'agents'} onClick={() => onShowDock('agents')}><Network size={18} /></IconButton>
         <IconButton label="记忆库" active={active === 'memory'} onClick={() => onShowDock('memory')}><Database size={18} /></IconButton>
+        <HiddenPanelLibrary panels={hiddenPanels} onRestore={onShowDock} />
       </div>
       <div className="rail-secondary">
+        {onResetLayout ? <IconButton label="重置工作区布局" onClick={onResetLayout}><RotateCcw size={17} /></IconButton> : null}
         <div className="user-avatar" aria-label="当前用户">GX</div>
       </div>
     </nav>
@@ -815,7 +670,7 @@ export interface ExecutionFileChange {
 export interface ExecutionStep {
   id: string
   sequence: number
-  kind: 'run' | 'model' | 'tool' | 'file' | 'agent' | 'guidance' | 'context'
+  kind: 'run' | 'model' | 'tool' | 'file' | 'agent' | 'guidance' | 'context' | 'approval'
   title: string
   summary: string
   status: ExecutionStatus
@@ -856,6 +711,7 @@ function toolSummary(name: string, args?: Record<string, unknown>) {
   if (name === 'run_command') {
     const program = firstString(args.program)
     const commandArgs = Array.isArray(args.args) ? args.args.map(displayArgument) : []
+    if (program && commandArgs[0] === program) commandArgs.shift()
     return [program, ...commandArgs].filter(Boolean).join(' ') || 'Command arguments unavailable'
   }
   if (name === 'delegate_task') return firstString(args.task, args.name) ?? 'Delegated task'
@@ -871,6 +727,7 @@ export function executionSteps(events: RuntimeEventRecord[]) {
   const tools = new Map<string, ExecutionStep>()
   const models = new Map<string, ExecutionStep>()
   const agents = new Map<string, ExecutionStep>()
+  const approvals = new Map<string, ExecutionStep>()
   const ordered = [...events].sort((left, right) => left.sequence - right.sequence || left.timestamp - right.timestamp)
 
   ordered.forEach((event) => {
@@ -951,6 +808,53 @@ export function executionSteps(events: RuntimeEventRecord[]) {
       models.set(key, step)
       return
     }
+    if (event.type === 'approval.requested' || event.type === 'approval.resolved') {
+      const batchId = firstString(event.payload.id) ?? event.id
+      const fileCount = Array.isArray(event.payload.files) ? event.payload.files.length : 0
+      const requested = event.type === 'approval.requested'
+      const step = approvals.get(batchId) ?? {
+        id: `approval:${batchId}`,
+        sequence: event.sequence,
+        kind: 'approval' as const,
+        title: requested ? 'File review requested' : 'File review completed',
+        summary: `${fileCount} file${fileCount === 1 ? '' : 's'}`,
+        status: requested ? 'running' as const : 'completed' as const,
+        timestamp: event.timestamp,
+        files: [],
+      }
+      step.title = requested ? 'File review requested' : 'File review completed'
+      step.status = requested ? 'running' : 'completed'
+      step.summary = `${fileCount} file${fileCount === 1 ? '' : 's'} · ${firstString(event.payload.status) ?? (requested ? 'pending' : 'resolved')}`
+      step.details = event.payload
+      if (!approvals.has(batchId)) steps.push(step)
+      approvals.set(batchId, step)
+      return
+    }
+    if (event.type === 'mcp.approval.requested' || event.type === 'mcp.approval.resolved') {
+      const approvalId = firstString(event.payload.approvalRequestId) ?? event.id
+      const key = `mcp:${approvalId}`
+      const requested = event.type === 'mcp.approval.requested'
+      const server = firstString(event.payload.serverLabel) ?? 'MCP server'
+      const tool = firstString(event.payload.name) ?? 'tool'
+      const step = approvals.get(key) ?? {
+        id: `approval:${key}`,
+        sequence: event.sequence,
+        kind: 'approval' as const,
+        title: requested ? 'MCP tool approval' : 'MCP tool decision',
+        summary: `${server} · ${tool}`,
+        status: requested ? 'running' as const : 'completed' as const,
+        timestamp: event.timestamp,
+        files: [],
+      }
+      step.title = requested ? 'MCP tool approval' : 'MCP tool decision'
+      step.status = requested ? 'running' : 'completed'
+      step.summary = `${server} · ${tool}`
+      step.arguments = requested ? parsedArguments(event.payload.arguments) : step.arguments
+      step.details = event.payload
+      if (!approvals.has(key)) steps.push(step)
+      approvals.set(key, step)
+      return
+    }
 
     const common = { id: event.id, sequence: event.sequence, timestamp: event.timestamp, files: [] as ExecutionFileChange[] }
     if (event.type === 'run.created') steps.push({
@@ -972,7 +876,8 @@ export function executionSteps(events: RuntimeEventRecord[]) {
       const agentId = eventAgentId(event)
       const step = agents.get(agentId) ?? { ...common, id: `agent:${agentId}`, kind: 'agent' as const, title: `Agent · ${firstString(event.payload.name) ?? agentId}`, summary: 'Delegated task', status: 'running' as const }
       step.status = runtimeAgentState(event.payload.status, event.type) === 'failed' ? 'failed' : runtimeAgentState(event.payload.status, event.type) === 'cancelled' ? 'cancelled' : 'completed'
-      step.summary = firstString(event.payload.error, event.payload.result, event.payload.task) ?? 'Delegated task finished'
+      step.summary = firstString(event.payload.error, event.payload.task, step.details?.task) ?? 'Delegated task finished'
+      step.output = firstString(event.payload.result)
       step.details = { ...step.details, ...event.payload }
       if (!agents.has(agentId)) steps.push(step)
       agents.set(agentId, step)
@@ -1013,17 +918,20 @@ function ExecutionStatusIcon({ status }: { status: ExecutionStatus }) {
 
 function ExecutionStepDisclosure({
   step,
+  displayNumber,
   command,
   onOpenFile,
 }: {
   step: ExecutionStep
+  displayNumber: number
   command?: ExecutionDisclosureCommand | null
   onOpenFile?: (path: string) => void
 }) {
   const [open, setOpen] = useState(step.status === 'running')
   const userToggled = useRef(false)
   const previousStatus = useRef(step.status)
-  const disclosureLabel = `${step.title}: ${step.summary} (step ${step.sequence})`
+  const shortSummary = step.summary.length > 96 ? `${step.summary.slice(0, 93)}...` : step.summary
+  const disclosureLabel = `${step.title}${shortSummary === step.title ? '' : `: ${shortSummary}`} (step ${displayNumber})`
   useEffect(() => {
     if (!command) return
     userToggled.current = true
@@ -1036,7 +944,7 @@ function ExecutionStepDisclosure({
   return <details aria-label={disclosureLabel} className={`execution-step state-${step.status}`} open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
     <summary aria-label={disclosureLabel} onClick={() => { userToggled.current = true }}>
       <span className="execution-status"><ExecutionStatusIcon status={step.status} /></span>
-      <span className="execution-step-copy"><strong><code>#{step.sequence}</code><span>{step.title}</span></strong><small>{step.summary}</small></span>
+      <span className="execution-step-copy"><strong><code title={`Event sequence ${step.sequence}`}>#{displayNumber}</code><span>{step.title}</span></strong>{step.summary !== step.title ? <small>{step.summary}</small> : null}</span>
       {step.durationMs !== undefined ? <time>{formatDuration(step.durationMs)}</time> : null}
       <ChevronRight className="execution-chevron" size={14} />
     </summary>
@@ -1047,7 +955,9 @@ function ExecutionStepDisclosure({
           <FilePenLine size={13} /><span>{file.path}</span><code>{file.startLine === file.endLine ? `L${file.startLine}` : `L${file.startLine}-${file.endLine}`}</code>
         </button>
       ))}</div></section> : null}
-      {step.output ? <section><span>Result</span><pre>{step.output}</pre></section> : null}
+      {step.output ? <section><span>Result</span>{step.kind === 'agent'
+        ? <div className="execution-result-markdown"><MarkdownBody body={step.output} /></div>
+        : <pre>{step.output}</pre>}</section> : null}
       {step.details && !step.arguments && !step.output ? <section><span>Evidence</span><pre>{JSON.stringify(step.details, null, 2)}</pre></section> : null}
     </div>
   </details>
@@ -1055,7 +965,7 @@ function ExecutionStepDisclosure({
 
 function ExecutionStepList({ steps, command, onOpenFile }: { steps: ExecutionStep[]; command?: ExecutionDisclosureCommand | null; onOpenFile?: (path: string) => void }) {
   return <div className="execution-steps">
-    {steps.map((step) => <ExecutionStepDisclosure step={step} command={command} onOpenFile={onOpenFile} key={step.id} />)}
+    {steps.map((step, index) => <ExecutionStepDisclosure step={step} displayNumber={index + 1} command={command} onOpenFile={onOpenFile} key={step.id} />)}
   </div>
 }
 
@@ -1082,7 +992,9 @@ export function currentExecutionSummary(events: RuntimeEventRecord[], runId?: st
   const item = eventItem(latest)
   if (latest.type === 'tool.started') {
     const name = firstString(item?.name) ?? 'tool'
-    return `${toolTitle(name)} · ${toolSummary(name, parsedArguments(item?.arguments))}`
+    const title = toolTitle(name)
+    const summary = toolSummary(name, parsedArguments(item?.arguments))
+    return title === summary ? title : `${title} · ${summary}`
   }
   if (latest.type === 'model.requested') return `Waiting for ${firstString(latest.payload.model) ?? 'model'} · turn ${String(latest.payload.round ?? 1)}`
   if (latest.type === 'file.changed') return `Changed ${firstString(latest.payload.path) ?? 'workspace file'}`
@@ -1093,14 +1005,28 @@ export function currentExecutionSummary(events: RuntimeEventRecord[], runId?: st
   return latest.type.replaceAll('.', ' ')
 }
 
-function ExecutionTimeline({ events, onOpenFile }: { events: RuntimeEventRecord[]; onOpenFile?: (path: string) => void }) {
+function ExecutionTimeline({
+  events,
+  stepStart,
+  stepEnd,
+  onOpenFile,
+}: {
+  events: RuntimeEventRecord[]
+  stepStart?: number
+  stepEnd?: number
+  onOpenFile?: (path: string) => void
+}) {
   const [command, setCommand] = useState<ExecutionDisclosureCommand | null>(null)
   const runId = latestRunId(events)
   if (!runId) return null
   const runEvents = events.filter((event) => event.runId === runId)
   const started = runEvents.find((event) => event.type === 'run.created')
   const status = executionStatus(runEvents)
-  const steps = executionSteps(runEvents)
+  const steps = executionSteps(runEvents).filter((step) => (
+    (stepStart === undefined || step.timestamp >= stepStart)
+    && (stepEnd === undefined || step.timestamp < stepEnd)
+  ))
+  if (!steps.length) return null
   return <section className={`execution-timeline state-${status}`} aria-label="运行执行步骤">
     <header>
       <span className="execution-run-mark"><Command size={14} /></span>
@@ -1126,6 +1052,7 @@ export function ConversationPanel({
   draftRequest,
   notice,
   events = [],
+  renderRunApprovals,
   onOpenExecutionFile,
   onSend,
   onRemoveQueued = () => undefined,
@@ -1141,6 +1068,7 @@ export function ConversationPanel({
   draftRequest?: ComposerDraftRequest | null
   notice?: string
   events?: RuntimeEventRecord[]
+  renderRunApprovals?: (events: RuntimeEventRecord[]) => ReactNode
   onOpenExecutionFile?: (path: string) => void
   onSend: (text: string, mode: ComposerSendMode) => Promise<boolean>
   onRemoveQueued?: (id: string) => void
@@ -1151,16 +1079,14 @@ export function ConversationPanel({
   const [submitting, setSubmitting] = useState(false)
   const submittingRef = useRef(false)
   const wasRunActive = useRef(runActive)
-  const streamEnd = useRef<HTMLDivElement>(null)
   const composerInput = useRef<HTMLTextAreaElement>(null)
   const handledDraftRequest = useRef('')
   const draft = drafts[session.id] ?? ''
   const workingAgents = agents.filter((agent) => agent.state === 'working')
   const activeWorker = workingAgents.find((agent) => agent.parent) ?? workingAgents[0]
-
-  useEffect(() => {
-    streamEnd.current?.scrollIntoView({ block: 'nearest' })
-  }, [session.id, liveMessage?.body, messages.length])
+  const timeline = useMemo(() => conversationTimeline(messages, events), [events, messages])
+  const contentRevision = `${messages.at(-1)?.id ?? ''}:${liveMessage?.body.length ?? 0}:${events.length}:${events.at(-1)?.id ?? ''}`
+  const { streamRef, streamEndRef, following, onScroll, scrollToLatest } = useConversationAutoscroll(session.id, contentRevision)
 
   useEffect(() => {
     if (runActive && !wasRunActive.current) setRunInputMode('steer')
@@ -1208,19 +1134,31 @@ export function ConversationPanel({
         </div>
       </div>
 
-      <div className="message-stream" aria-live="polite">
-        <div className="stream-date"><span />Today · {messages[0]?.time.slice(0, 5) ?? 'now'}<span /></div>
-        {messages.map((message) => <MessageCard key={message.id} message={message} />)}
-        {liveMessage ? <MessageCard message={liveMessage} /> : null}
-        {events.length ? <ExecutionTimeline events={events} onOpenFile={onOpenExecutionFile} /> : null}
-        {activeWorker ? (
-          <div className="agent-thinking">
-            <span className="thinking-caret">›</span>
-            <span>{activeWorker.name} · <code>{activeWorker.task}</code></span>
-            <span className="thinking-time">{activeWorker.progress}%</span>
-          </div>
-        ) : null}
-        <div ref={streamEnd} />
+      <div className="message-stream-shell">
+        <div className="message-stream" aria-live="polite" ref={streamRef} onScroll={onScroll}>
+          <div className="stream-date"><span />Today · {messages[0]?.time.slice(0, 5) ?? 'now'}<span /></div>
+          {timeline.map((item) => {
+            if (item.kind === 'message') return <MessageCard key={item.id} message={item.message} />
+            const segmentEvents = item.events.filter((event) => (
+              (item.stepStart === undefined || event.timestamp >= item.stepStart)
+              && (item.stepEnd === undefined || event.timestamp < item.stepEnd)
+            ))
+            return <Fragment key={item.id}>
+              <ExecutionTimeline events={item.events} stepStart={item.stepStart} stepEnd={item.stepEnd} onOpenFile={onOpenExecutionFile} />
+              {renderRunApprovals?.(segmentEvents)}
+            </Fragment>
+          })}
+          {liveMessage ? <MessageCard message={liveMessage} /> : null}
+          {activeWorker ? (
+            <div className="agent-thinking">
+              <span className="thinking-caret">›</span>
+              <span>{activeWorker.name} · <code>{activeWorker.task}</code></span>
+              <span className="thinking-time">{activeWorker.progress}%</span>
+            </div>
+          ) : null}
+          <div ref={streamEndRef} />
+        </div>
+        {!following ? <button type="button" className="message-follow-button" onClick={scrollToLatest}><ChevronDown size={14} />Latest</button> : null}
       </div>
 
       {queuedPrompts.length ? (
@@ -1862,6 +1800,7 @@ export function GitPanel({
   onPull,
   onPush,
   onOpenFile,
+  loadGraph,
 }: {
   workspace: WorkspaceView | null
   history: GitCommitRecord[]
@@ -1881,6 +1820,7 @@ export function GitPanel({
   onPull: () => Promise<boolean>
   onPush: () => Promise<boolean>
   onOpenFile: (path: string) => void
+  loadGraph?: (path: string, limit: number) => Promise<GitGraphSnapshot>
 }) {
   const [branchDraft, setBranchDraft] = useState('')
   const [commitMessage, setCommitMessage] = useState('')
@@ -1958,6 +1898,7 @@ export function GitPanel({
     <details className="source-section source-history" aria-label="Commit history" open={openSections.history} onToggle={(event) => setSectionOpen('history', event.currentTarget.open)}>
       <summary className="source-section-title"><ChevronRight size={13} /><span>History</span><code>{history.length || ''}</code></summary>
       <div className="source-section-body">
+        <GitGraphSection workspacePath={workspace.path} refreshToken={`${snapshot.branch}:${history[0]?.hash ?? ''}`} loadGraph={loadGraph} />
         {historyLoading ? <div className="source-operation"><LoaderCircle className="is-spinning" size={13} />Loading history</div> : null}
         {historyError ? <div className="source-result is-error" role="alert">History unavailable: {historyError}</div> : null}
         {!historyLoading && !historyError && !history.length ? <p className="source-history-empty">No commits yet</p> : null}
@@ -2387,17 +2328,25 @@ export function ProviderSettings({
   open,
   providers,
   preferences,
+  integrations = emptyIntegrationSettings,
+  permissionMode = 'request-approval',
+  desktop = false,
   onClose,
   onSave,
 }: {
   open: boolean
   providers: Provider[]
   preferences: UiPreferences
+  integrations?: IntegrationSettingsValue
+  permissionMode?: PermissionMode
+  desktop?: boolean
   onClose: () => void
-  onSave: (providers: Provider[], preferences: UiPreferences, resetLayout: boolean) => void
+  onSave: (providers: Provider[], preferences: UiPreferences, integrations: IntegrationSettingsValue, permissionMode: PermissionMode, resetLayout: boolean) => void
 }) {
   const [draft, setDraft] = useState(providers)
   const [preferenceDraft, setPreferenceDraft] = useState(preferences)
+  const [integrationDraft, setIntegrationDraft] = useState(integrations)
+  const [permissionDraft, setPermissionDraft] = useState(permissionMode)
   const [testing, setTesting] = useState<string | null>(null)
   const [section, setSection] = useState<SettingsSection>('models')
   const [layoutReset, setLayoutReset] = useState(false)
@@ -2408,8 +2357,10 @@ export function ProviderSettings({
     if (!open) return
     setDraft(providers)
     setPreferenceDraft(preferences)
+    setIntegrationDraft(integrations)
+    setPermissionDraft(permissionMode)
     setLayoutReset(false)
-  }, [providers, preferences, open])
+  }, [providers, preferences, integrations, permissionMode, open])
   useEffect(() => {
     if (!open) return
     previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
@@ -2493,12 +2444,13 @@ export function ProviderSettings({
     <div className="settings-layer" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <aside ref={drawerRef} className="settings-drawer" role="dialog" aria-modal="true" aria-labelledby="settings-title">
         <header>
-          <div><span className="eyebrow">Settings</span><h2 id="settings-title">{section === 'models' ? 'Models & API' : 'Appearance'}</h2></div>
+          <div><span className="eyebrow">Settings</span><h2 id="settings-title">{section === 'models' ? 'Models & API' : section === 'integrations' ? 'Agent & tools' : 'Appearance'}</h2></div>
           <IconButton label="关闭设置" onClick={onClose}><X size={18} /></IconButton>
         </header>
 
         <nav className="settings-nav" aria-label="设置分类">
           <button type="button" aria-pressed={section === 'models'} className={section === 'models' ? 'is-active' : ''} onClick={() => setSection('models')}><Cpu size={15} />Models</button>
+          <button type="button" aria-pressed={section === 'integrations'} className={section === 'integrations' ? 'is-active' : ''} onClick={() => setSection('integrations')}><Boxes size={15} />Agent & tools</button>
           <button type="button" aria-pressed={section === 'appearance'} className={section === 'appearance' ? 'is-active' : ''} onClick={() => setSection('appearance')}><Layers3 size={15} />Appearance</button>
         </nav>
 
@@ -2553,6 +2505,11 @@ export function ProviderSettings({
               })}
               <button className="add-provider-button" type="button" disabled={Boolean(testing)} onClick={addProvider}><Plus size={14} />Add provider</button>
             </>
+          ) : section === 'integrations' ? (
+            <div className="agent-tool-settings">
+              <PermissionModeControl value={permissionDraft} disabled={Boolean(testing)} onChange={setPermissionDraft} />
+              <IntegrationSettings value={integrationDraft} onChange={setIntegrationDraft} desktop={desktop} />
+            </div>
           ) : (
             <div className="appearance-settings">
               <section>
@@ -2594,7 +2551,7 @@ export function ProviderSettings({
 
         <footer>
           <button className="secondary-button" type="button" onClick={onClose}>Cancel</button>
-          <button className="primary-button" type="button" disabled={Boolean(testing)} onClick={() => { onSave(draft, preferenceDraft, layoutReset); onClose() }}>Save settings</button>
+          <button className="primary-button" type="button" disabled={Boolean(testing)} onClick={() => { onSave(draft, preferenceDraft, integrationDraft, permissionDraft, layoutReset); onClose() }}>Save settings</button>
         </footer>
       </aside>
     </div>
@@ -2653,6 +2610,10 @@ export default function App() {
   const [runState, setRunState] = useState<'idle' | 'running'>('idle')
   const [runCancelPending, setRunCancelPending] = useState(false)
   const [providers, setProviders] = useState<Provider[]>(loadProviders)
+  const [integrations, setIntegrations] = useState<IntegrationSettingsValue>(loadIntegrationSettings)
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>(() => (
+    loadStored<PermissionMode>('traceframe.permission-mode', 'request-approval') === 'full-access' ? 'full-access' : 'request-approval'
+  ))
   const [native, setNative] = useState<NativeCapabilities | null>(null)
   const [workspace, setWorkspace] = useState<WorkspaceView | null>(null)
   const workspaceRef = useRef<WorkspaceView | null>(null)
@@ -2704,10 +2665,22 @@ export default function App() {
   const [preferences, setPreferences] = useState<UiPreferences>(() => ({ ...defaultUiPreferences, ...loadStored('traceframe.appearance', defaultUiPreferences) }))
   const [dockModel, setDockModel] = useState(() => storedDockModel(preferences.layout))
   const [activeRail, setActiveRail] = useState<RailComponent | null>(() => selectedRailComponent(dockModel, true))
+  const [hiddenPanels, setHiddenPanels] = useState<DockComponent[]>(() => hiddenDockComponents(dockModel))
 
   const showDock = useCallback((component: DockComponent) => {
-    if (dockModel.getNodeById(component)) dockModel.doAction(Actions.selectTab(component))
+    showOrRestoreDockComponent(dockModel, component)
+    persistDockModel(dockModel)
+    setHiddenPanels(hiddenDockComponents(dockModel))
+    setActiveRail(selectedRailComponent(dockModel))
   }, [dockModel])
+
+  const resetDockLayout = useCallback(() => {
+    const nextDockModel = Model.fromJson(dockLayoutJson(preferences.layout))
+    setDockModel(nextDockModel)
+    setActiveRail(selectedRailComponent(nextDockModel, true))
+    setHiddenPanels([])
+    persistDockModel(nextDockModel)
+  }, [preferences.layout])
 
   const setFollowAgent = useCallback((enabled: boolean) => {
     followAgentEditsRef.current = enabled
@@ -3397,7 +3370,17 @@ export default function App() {
       }
       void (async () => {
         try {
-          await startNativeRun({ runId, sessionId, workspacePath: workspace.path, branch, prompt: text, provider }, (event) => {
+          await startNativeRun({
+            runId,
+            sessionId,
+            workspacePath: workspace.path,
+            branch,
+            prompt: text,
+            provider,
+            permissionMode,
+            skills: integrations.skills,
+            mcpServers: integrations.mcpServers,
+          }, (event) => {
             setRuntimeEvents((current) => [event, ...current.filter((item) => item.id !== event.id)].slice(0, MAX_RENDERER_EVENTS))
             if (event.type === 'run.steered' && (!event.payload.agentId || event.payload.agentId === 'root')) {
               setComposerNotices((current) => ({ ...current, [sessionId]: 'Guidance applied at the next turn boundary' }))
@@ -3413,6 +3396,15 @@ export default function App() {
               showDock('code')
               if (editorDirtyRef.current) return
               navigateToAgentEdit(target, workspace.path)
+            }
+            if (event.type === 'approval.requested') {
+              setComposerNotices((current) => ({ ...current, [sessionId]: 'Review the changed files below to continue this run' }))
+            } else if (event.type === 'approval.resolved') {
+              setComposerNotices((current) => ({ ...current, [sessionId]: 'File review completed; the run is resuming' }))
+            } else if (event.type === 'mcp.approval.requested') {
+              setComposerNotices((current) => ({ ...current, [sessionId]: 'Review the MCP tool request below to continue this run' }))
+            } else if (event.type === 'mcp.approval.resolved') {
+              setComposerNotices((current) => ({ ...current, [sessionId]: 'MCP tool decision recorded; the run is resuming' }))
             }
           })
         } catch (error) {
@@ -3588,20 +3580,31 @@ export default function App() {
         setAppError('Restore this archived session before sending another prompt.')
         return
       }
-      if (dockModel.getNodeById('conversation')) dockModel.doAction(Actions.selectTab('conversation'))
+      showDock('conversation')
       requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus())
     }
   }
 
-  const saveSettings = (next: Provider[], nextPreferences: UiPreferences, resetLayout: boolean) => {
+  const saveSettings = (
+    next: Provider[],
+    nextPreferences: UiPreferences,
+    nextIntegrations: IntegrationSettingsValue,
+    nextPermissionMode: PermissionMode,
+    resetLayout: boolean,
+  ) => {
     setProviders(next)
+    setIntegrations(nextIntegrations)
+    setPermissionMode(nextPermissionMode)
     if (resetLayout) {
       const nextDockModel = Model.fromJson(dockLayoutJson(nextPreferences.layout))
       setDockModel(nextDockModel)
       setActiveRail(selectedRailComponent(nextDockModel, true))
+      setHiddenPanels([])
       persistDockModel(nextDockModel)
     }
     setPreferences(nextPreferences)
+    persistIntegrationSettings(nextIntegrations)
+    localStorage.setItem('traceframe.permission-mode', JSON.stringify(nextPermissionMode))
     localStorage.setItem('traceframe.providers', JSON.stringify(next.map(({ id, name, endpoint, model: providerModel, adapter }) => ({ id, name, endpoint, model: providerModel, adapter, connected: false, latency: 0 }))))
   }
 
@@ -3669,6 +3672,30 @@ export default function App() {
         draftRequest={composerDraftRequest}
         notice={composerNotices[activeSession.id]}
         events={activeEvents}
+        renderRunApprovals={(segmentEvents) => {
+          if (!desktop) return null
+          const fileEvent = [...segmentEvents].reverse().find((event) => event.type === 'approval.requested' || event.type === 'approval.resolved')
+          const batchId = firstString(fileEvent?.payload.id)
+          const hasMcpApproval = segmentEvents.some((event) => event.type === 'mcp.approval.requested' || event.type === 'mcp.approval.resolved')
+          if (!batchId && !hasMcpApproval) return null
+          return <div className="inline-run-approvals">
+            {batchId && fileEvent ? <ApprovalReviewPanel
+              sessionId={activeSession.id}
+              batchId={batchId}
+              refreshToken={fileEvent.id}
+              onChanged={() => {
+                if (workspace) void loadWorkspace(workspace.path, selectedFileRef.current).catch((error) => setAppError(errorMessage(error)))
+              }}
+            /> : null}
+            {hasMcpApproval ? <McpApproval
+              events={segmentEvents}
+              onDecided={(_, approve) => setComposerNotices((current) => ({
+                ...current,
+                [activeSession.id]: approve ? 'MCP tool approved; the run is resuming' : 'MCP tool rejected; the run is resuming',
+              }))}
+            /> : null}
+          </div>
+        }}
         onOpenExecutionFile={(path) => { showDock('code'); selectWorkspaceFile(path) }}
         onSend={sendMessage}
         onRemoveQueued={removeQueuedPrompt}
@@ -3815,8 +3842,10 @@ export default function App() {
       <AppRail
         changeCount={workspace?.snapshot.files.length ?? 0}
         active={activeRail}
+        hiddenPanels={hiddenPanels}
         onShowSessions={() => focusDockControl('sessions', '.session-filter input')}
         onShowDock={showDock}
+        onResetLayout={resetDockLayout}
       />
       <main className="dock-workspace">
         <Layout
@@ -3825,8 +3854,8 @@ export default function App() {
           realtimeResize
           onModelChange={(nextModel) => {
             persistDockModel(nextModel)
-            const selected = selectedRailComponent(nextModel)
-            if (selected) setActiveRail(selected)
+            setHiddenPanels(hiddenDockComponents(nextModel))
+            setActiveRail(selectedRailComponent(nextModel))
           }}
         />
       </main>
@@ -3835,6 +3864,9 @@ export default function App() {
         open={settingsOpen}
         providers={providers}
         preferences={preferences}
+        integrations={integrations}
+        permissionMode={permissionMode}
+        desktop={desktop}
         onClose={closeSettings}
         onSave={saveSettings}
       />

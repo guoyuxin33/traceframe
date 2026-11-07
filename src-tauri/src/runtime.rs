@@ -1,3 +1,6 @@
+use crate::integrations::{
+    load_skill_instructions, responses_mcp_tools, RuntimeMcpServer, RuntimeSkill,
+};
 use crate::store::{AppStore, MemoryRecord, MessageRecord, NewMessage};
 use crate::{
     create_workspace_file_at, git_diff_at, git_snapshot_at, read_workspace_file_at,
@@ -18,6 +21,11 @@ use std::time::{Duration, Instant};
 use tauri::{ipc::Channel, State};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
+use tokio::sync::Notify;
+
+pub(crate) mod approvals;
+pub use approvals::{approval_batches, approval_decide};
+use approvals::{ApprovalBatchStatus, PermissionMode, WorkspaceChangeJournal};
 
 const MAX_ERROR_BYTES: usize = 64 * 1024;
 const MAX_STREAM_BYTES: usize = 8 * 1024 * 1024;
@@ -48,7 +56,15 @@ pub struct RuntimeControl {
 struct ActiveRun {
     cancellation: AtomicBool,
     steering: Mutex<SteeringInbox>,
+    mcp_approvals: Mutex<HashMap<String, Option<McpApprovalDecision>>>,
+    approval: Notify,
     session_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct McpApprovalDecision {
+    approve: bool,
+    reason: String,
 }
 
 #[derive(Debug)]
@@ -67,6 +83,8 @@ impl ActiveRun {
                 accepting: accepts_steering,
                 finishing: false,
             }),
+            mcp_approvals: Mutex::new(HashMap::new()),
+            approval: Notify::new(),
             session_id: session_id.to_owned(),
         }
     }
@@ -98,6 +116,7 @@ impl ActiveRun {
             return Ok(false);
         }
         self.cancellation.store(true, Ordering::SeqCst);
+        self.approval.notify_waiters();
         inbox.accepting = false;
         inbox.messages.clear();
         Ok(true)
@@ -118,6 +137,69 @@ impl ActiveRun {
             .map_err(|_| "Runtime steering state is unavailable".to_string())?;
         inbox.accepting = false;
         Ok(inbox.messages.drain(..).collect())
+    }
+
+    fn register_mcp_approval(&self, approval_id: &str) -> Result<(), String> {
+        let mut approvals = self
+            .mcp_approvals
+            .lock()
+            .map_err(|_| "MCP approval state is unavailable".to_string())?;
+        if approvals.insert(approval_id.to_owned(), None).is_some() {
+            return Err("MCP approval request ID was reused".into());
+        }
+        Ok(())
+    }
+
+    fn take_mcp_decision(&self, approval_id: &str) -> Result<Option<McpApprovalDecision>, String> {
+        let mut approvals = self
+            .mcp_approvals
+            .lock()
+            .map_err(|_| "MCP approval state is unavailable".to_string())?;
+        let decision = approvals
+            .get(approval_id)
+            .and_then(|decision| decision.clone());
+        if decision.is_some() {
+            approvals.remove(approval_id);
+        }
+        Ok(decision)
+    }
+}
+
+async fn wait_for_approval(
+    active: &ActiveRun,
+    store: &AppStore,
+    batch_id: &str,
+) -> Result<Option<approvals::ApprovalBatchRecord>, String> {
+    loop {
+        if active.cancellation.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let batch = store.approval_batch_record(batch_id)?;
+        if batch.status != ApprovalBatchStatus::Pending {
+            return Ok(Some(batch));
+        }
+        tokio::select! {
+            _ = active.approval.notified() => {},
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+        }
+    }
+}
+
+async fn wait_for_mcp_approval(
+    active: &ActiveRun,
+    approval_id: &str,
+) -> Result<Option<McpApprovalDecision>, String> {
+    loop {
+        if active.cancellation.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        if let Some(decision) = active.take_mcp_decision(approval_id)? {
+            return Ok(Some(decision));
+        }
+        tokio::select! {
+            _ = active.approval.notified() => {},
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+        }
     }
 }
 
@@ -208,6 +290,38 @@ impl RuntimeControl {
         };
         active.cancel()
     }
+
+    fn notify_approval(&self, run_id: &str) -> Result<(), String> {
+        if let Some(active) = self.active(run_id)? {
+            active.approval.notify_waiters();
+        }
+        Ok(())
+    }
+
+    fn resolve_mcp_approval(
+        &self,
+        run_id: &str,
+        approval_id: &str,
+        decision: McpApprovalDecision,
+    ) -> Result<bool, String> {
+        let Some(active) = self.active(run_id)? else {
+            return Ok(false);
+        };
+        let mut approvals = active
+            .mcp_approvals
+            .lock()
+            .map_err(|_| "MCP approval state is unavailable".to_string())?;
+        let Some(pending) = approvals.get_mut(approval_id) else {
+            return Err("MCP approval request is not pending on this run".into());
+        };
+        if pending.is_some() {
+            return Err("MCP approval request has already been decided".into());
+        }
+        *pending = Some(decision);
+        drop(approvals);
+        active.approval.notify_waiters();
+        Ok(true)
+    }
 }
 
 struct RunRegistration<'a> {
@@ -248,6 +362,12 @@ pub struct RuntimeRequest {
     pub branch: String,
     pub prompt: String,
     pub provider: ProviderConfig,
+    #[serde(default)]
+    pub permission_mode: Option<PermissionMode>,
+    #[serde(default)]
+    pub skills: Vec<RuntimeSkill>,
+    #[serde(default)]
+    pub mcp_servers: Vec<RuntimeMcpServer>,
 }
 
 #[derive(Debug, Serialize)]
@@ -770,6 +890,16 @@ fn format_memories(memories: &[MemoryRecord]) -> String {
         .join("\n")
 }
 
+fn with_skill_instructions(base: String, skills: &str) -> String {
+    if skills.trim().is_empty() {
+        base
+    } else {
+        format!(
+            "{base}\n\nUser-enabled skill instructions follow. Apply them only within the authorized workspace and the current task scope:\n{skills}"
+        )
+    }
+}
+
 fn agent_instructions(
     request: &RuntimeRequest,
     summary: &str,
@@ -899,10 +1029,19 @@ struct ToolCall {
 }
 
 #[derive(Debug)]
+struct McpApprovalRequest {
+    id: String,
+    server_label: String,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug)]
 struct ResponsesRound {
     text: String,
     output_items: Vec<Value>,
     tool_calls: Vec<ToolCall>,
+    mcp_approval_requests: Vec<McpApprovalRequest>,
     usage: Value,
 }
 
@@ -1704,6 +1843,7 @@ async fn send_responses_request(
     allow_tools: bool,
     profile: AgentProfile,
     allow_delegate: bool,
+    mcp_tools: &[Value],
 ) -> Result<reqwest::Response, String> {
     if provider.model.trim().is_empty() {
         return Err("Responses provider model is required".into());
@@ -1718,7 +1858,9 @@ async fn send_responses_request(
         "include": ["reasoning.encrypted_content"]
     });
     if allow_tools {
-        body["tools"] = json!(tool_definitions(profile, allow_delegate));
+        let mut tools = tool_definitions(profile, allow_delegate);
+        tools.extend(mcp_tools.iter().cloned());
+        body["tools"] = json!(tools);
         body["tool_choice"] = json!("auto");
         body["parallel_tool_calls"] = json!(false);
     }
@@ -1727,6 +1869,74 @@ async fn send_responses_request(
         .send()
         .await
         .map_err(|error| format!("Responses request failed: {error}"))
+}
+
+fn responses_round_from_output(
+    mut text: String,
+    output_items: Vec<Value>,
+    usage: Value,
+) -> Result<ResponsesRound, String> {
+    if text.is_empty() {
+        text = response_output_text(&output_items);
+    }
+    let tool_calls = output_items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .map(|item| {
+            Ok(ToolCall {
+                call_id: item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "Responses function call is missing call_id".to_string())?
+                    .to_owned(),
+                name: item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "Responses function call is missing name".to_string())?
+                    .to_owned(),
+                arguments: item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}")
+                    .to_owned(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mcp_approval_requests = output_items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("mcp_approval_request"))
+        .map(|item| {
+            Ok(McpApprovalRequest {
+                id: item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "MCP approval request is missing id".to_string())?
+                    .to_owned(),
+                server_label: item
+                    .get("server_label")
+                    .and_then(Value::as_str)
+                    .unwrap_or("MCP server")
+                    .to_owned(),
+                name: item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_owned(),
+                arguments: item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}")
+                    .to_owned(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(ResponsesRound {
+        text,
+        output_items,
+        tool_calls,
+        mcp_approval_requests,
+        usage,
+    })
 }
 
 async fn stream_responses_round(
@@ -1827,38 +2037,7 @@ async fn stream_responses_round(
         return Err("Responses stream ended before a terminal event".into());
     }
     let output_items = completed_output.unwrap_or(item_events);
-    if text.is_empty() {
-        text = response_output_text(&output_items);
-    }
-    let tool_calls = output_items
-        .iter()
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
-        .map(|item| {
-            Ok(ToolCall {
-                call_id: item
-                    .get("call_id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| "Responses function call is missing call_id".to_string())?
-                    .to_owned(),
-                name: item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| "Responses function call is missing name".to_string())?
-                    .to_owned(),
-                arguments: item
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .unwrap_or("{}")
-                    .to_owned(),
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(Some(ResponsesRound {
-        text,
-        output_items,
-        tool_calls,
-        usage,
-    }))
+    responses_round_from_output(text, output_items, usage).map(Some)
 }
 
 async fn run_responses_agent(
@@ -1873,6 +2052,7 @@ async fn run_responses_agent(
     sequence: &mut u64,
     agent: &AgentContext,
     budget: &mut AgentBudget,
+    journal: &mut WorkspaceChangeJournal,
 ) -> Result<Option<AgentOutcome>, String> {
     let cancellation = &active.cancellation;
     let mut usage_rounds = Vec::new();
@@ -1942,6 +2122,14 @@ async fn run_responses_agent(
             )
         };
         let response = {
+            let mcp_tools = if allow_tools {
+                responses_mcp_tools(
+                    &request.mcp_servers,
+                    request.permission_mode.unwrap_or_default() == PermissionMode::FullAccess,
+                )?
+            } else {
+                Vec::new()
+            };
             let request_future = send_responses_request(
                 &request.provider,
                 &round_instructions,
@@ -1949,6 +2137,7 @@ async fn run_responses_agent(
                 allow_tools,
                 agent.profile,
                 allow_tools && agent.allow_delegate,
+                &mcp_tools,
             );
             tokio::pin!(request_future);
             loop {
@@ -2001,11 +2190,79 @@ async fn run_responses_agent(
                 "usage": round.usage,
                 "outputItemCount": round.output_items.len(),
                 "toolCallCount": round.tool_calls.len(),
+                "mcpApprovalCount": round.mcp_approval_requests.len(),
                 "textChars": round.text.chars().count(),
             }),
             agent,
         )?;
         usage_rounds.push(round.usage.clone());
+        if !round.mcp_approval_requests.is_empty() {
+            if !round.tool_calls.is_empty() {
+                return Err("Responses provider mixed MCP approvals with local tool calls".into());
+            }
+            if !allow_tools {
+                return Err(
+                    "Responses provider requested MCP approval after the tool budget was exhausted"
+                        .into(),
+                );
+            }
+            tool_rounds += 1;
+            input.extend(round.output_items);
+            for approval in round.mcp_approval_requests {
+                active.register_mcp_approval(&approval.id)?;
+                emit_agent(
+                    on_event,
+                    store,
+                    request,
+                    sequence,
+                    "mcp.approval.requested",
+                    json!({
+                        "approvalRequestId": &approval.id,
+                        "serverLabel": &approval.server_label,
+                        "name": &approval.name,
+                        "arguments": &approval.arguments,
+                    }),
+                    agent,
+                )?;
+                let Some(decision) = wait_for_mcp_approval(active, &approval.id).await? else {
+                    emit_agent(
+                        on_event,
+                        store,
+                        request,
+                        sequence,
+                        "run.cancelled",
+                        json!({ "reason": "user", "approvalRequestId": &approval.id }),
+                        agent,
+                    )?;
+                    return Ok(None);
+                };
+                emit_agent(
+                    on_event,
+                    store,
+                    request,
+                    sequence,
+                    "mcp.approval.resolved",
+                    json!({
+                        "approvalRequestId": &approval.id,
+                        "serverLabel": &approval.server_label,
+                        "name": &approval.name,
+                        "approve": decision.approve,
+                        "reason": &decision.reason,
+                    }),
+                    agent,
+                )?;
+                let mut response = json!({
+                    "type": "mcp_approval_response",
+                    "approval_request_id": approval.id,
+                    "approve": decision.approve,
+                });
+                if !decision.reason.is_empty() {
+                    response["reason"] = json!(decision.reason);
+                }
+                input.push(response);
+            }
+            continue;
+        }
         if round.tool_calls.is_empty() {
             if round.text.trim().is_empty() {
                 return Err("Responses agent completed without text or tool calls".into());
@@ -2172,7 +2429,10 @@ async fn run_responses_agent(
                                 "delegateCallId": call.call_id,
                             }),
                         )?;
-                        let child_instructions = specialist_instructions(request, &child);
+                        let child_instructions = with_skill_instructions(
+                            specialist_instructions(request, &child),
+                            &load_skill_instructions(&request.skills)?,
+                        );
                         let child_input = vec![json!({
                             "role": "user",
                             "content": child.task,
@@ -2189,6 +2449,7 @@ async fn run_responses_agent(
                             sequence,
                             &child,
                             budget,
+                            journal,
                         ))
                         .await
                         {
@@ -2280,6 +2541,12 @@ async fn run_responses_agent(
                         }
                     }
                 }
+            } else if let Err(error) = journal.capture_tool_call(&call.name, &call.arguments) {
+                ToolExecution {
+                    output: json!({ "error": error }).to_string(),
+                    changed_files: Vec::new(),
+                    ok: false,
+                }
             } else {
                 match execute_tool(&call.name, &call.arguments, workspace, access, cancellation)
                     .await
@@ -2293,6 +2560,7 @@ async fn run_responses_agent(
                 }
             };
             for change in &execution.changed_files {
+                journal.register_changed_path(&change.path)?;
                 emit_agent(
                     on_event,
                     store,
@@ -2418,6 +2686,9 @@ pub async fn runtime_start(
         request.provider.adapter.as_str(),
         "cc-switch-responses" | "openai-responses"
     );
+    let permission_mode = request
+        .permission_mode
+        .unwrap_or(PermissionMode::RequestApproval);
     let active = control.register(&request.run_id, &request.session_id, supports_steering)?;
     let _registration = RunRegistration {
         control: &control,
@@ -2438,13 +2709,17 @@ pub async fn runtime_start(
             "model": request.provider.model,
             "workspace": request.workspace_path,
             "branch": request.branch,
+            "permissionMode": permission_mode,
         }),
     )?;
     let (summary, context) = store.context_messages(&request.session_id)?;
     let memories = store.context_memories(&request.session_id, &request.workspace_path)?;
 
     if supports_steering {
-        let instructions = agent_instructions(&request, &summary, &memories);
+        let instructions = with_skill_instructions(
+            agent_instructions(&request, &summary, &memories),
+            &load_skill_instructions(&request.skills)?,
+        );
         let input = responses_input(&context, &request.prompt);
         let root_agent = AgentContext {
             id: "root".into(),
@@ -2456,6 +2731,7 @@ pub async fn runtime_start(
             profile: AgentProfile::Root,
         };
         let mut budget = AgentBudget::default();
+        let mut journal = WorkspaceChangeJournal::new(&workspace)?;
         let result = run_responses_agent(
             &request,
             &workspace,
@@ -2468,8 +2744,69 @@ pub async fn runtime_start(
             &mut sequence,
             &root_agent,
             &mut budget,
+            &mut journal,
         )
         .await;
+        let changes = match journal.prepare() {
+            Ok(changes) => changes,
+            Err(error) => {
+                emit_run_failed(&on_event, &store, &request, &mut sequence, &error);
+                return Err(error);
+            }
+        };
+        let approval = if changes.is_empty() {
+            None
+        } else {
+            let batch = store.create_approval_batch_record(
+                &request.session_id,
+                &request.run_id,
+                &request.workspace_path,
+                permission_mode,
+                changes,
+                permission_mode == PermissionMode::FullAccess,
+            )?;
+            emit(
+                &on_event,
+                &store,
+                &request,
+                &mut sequence,
+                if batch.status == ApprovalBatchStatus::Pending {
+                    "approval.requested"
+                } else {
+                    "approval.resolved"
+                },
+                serde_json::to_value(&batch)
+                    .map_err(|error| format!("Approval batch could not be encoded: {error}"))?,
+            )?;
+            if batch.status == ApprovalBatchStatus::Pending
+                && !active.cancellation.load(Ordering::SeqCst)
+            {
+                let Some(resolved) = wait_for_approval(&active, &store, &batch.id).await? else {
+                    emit(
+                        &on_event,
+                        &store,
+                        &request,
+                        &mut sequence,
+                        "run.cancelled",
+                        json!({ "reason": "user", "approvalBatchId": batch.id }),
+                    )?;
+                    return Ok(());
+                };
+                emit(
+                    &on_event,
+                    &store,
+                    &request,
+                    &mut sequence,
+                    "approval.resolved",
+                    serde_json::to_value(&resolved).map_err(|error| {
+                        format!("Approval decision could not be encoded: {error}")
+                    })?,
+                )?;
+                Some(resolved)
+            } else {
+                Some(batch)
+            }
+        };
         return match result {
             Ok(Some(outcome)) => {
                 store.append_message_record(NewMessage {
@@ -2490,6 +2827,8 @@ pub async fn runtime_start(
                         "rounds": outcome.rounds,
                         "usage": outcome.usage,
                         "delegatedAgents": budget.delegated,
+                        "approvalBatchId": approval.as_ref().map(|batch| batch.id.as_str()),
+                        "approvalStatus": approval.as_ref().map(|batch| batch.status),
                     }),
                 )?;
                 Ok(())
@@ -2775,6 +3114,31 @@ pub fn runtime_cancel(run_id: String, control: State<'_, RuntimeControl>) -> Res
     control.cancel(&run_id)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpApprovalDecisionRequest {
+    run_id: String,
+    approval_request_id: String,
+    approve: bool,
+    #[serde(default)]
+    reason: String,
+}
+
+#[tauri::command]
+pub fn mcp_approval_decide(
+    request: McpApprovalDecisionRequest,
+    control: State<'_, RuntimeControl>,
+) -> Result<bool, String> {
+    control.resolve_mcp_approval(
+        &request.run_id,
+        &request.approval_request_id,
+        McpApprovalDecision {
+            approve: request.approve,
+            reason: request.reason.trim().chars().take(500).collect(),
+        },
+    )
+}
+
 #[tauri::command]
 pub fn runtime_steer(
     run_id: String,
@@ -2792,15 +3156,16 @@ mod tests {
         changed_command_files, changed_line_range, command_allowed, command_file_states,
         diff_changed_range, execute_tool, merge_usage, model_tool_output, parse_sse_data,
         provider_healthcheck_with_timeout, read_bounded_output, response_failure,
-        response_output_text, responses_input, run_responses_agent, send_anthropic_request,
-        send_responses_request, take_sse_block, terminate_child, tool_definitions, ActiveRun,
-        AgentBudget, AgentContext, AgentProfile, MemoryRecord, MessageRecord, ProviderConfig,
-        RuntimeControl, RuntimeRequest, ANTHROPIC_MAX_TOKENS, MAX_ERROR_BYTES,
-        MAX_MODEL_TOOL_OUTPUT_CHARS, MAX_STEERING_MESSAGES, MAX_STEERING_MESSAGE_CHARS,
-        MAX_TOOL_ROUNDS,
+        response_output_text, responses_input, responses_round_from_output, run_responses_agent,
+        send_anthropic_request, send_responses_request, take_sse_block, terminate_child,
+        tool_definitions, wait_for_mcp_approval, ActiveRun, AgentBudget, AgentContext,
+        AgentProfile, McpApprovalDecision, MemoryRecord, MessageRecord, ProviderConfig,
+        RuntimeControl, RuntimeRequest, WorkspaceChangeJournal, ANTHROPIC_MAX_TOKENS,
+        MAX_ERROR_BYTES, MAX_MODEL_TOOL_OUTPUT_CHARS, MAX_STEERING_MESSAGES,
+        MAX_STEERING_MESSAGE_CHARS, MAX_TOOL_ROUNDS,
     };
     use crate::{store::AppStore, WorkspaceAccess};
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::AtomicBool;
@@ -2894,6 +3259,54 @@ mod tests {
         assert!(control.register("run-1", "session-1", true).is_err());
         control.unregister("run-1", &first);
         assert!(control.register("run-1", "session-1", true).is_ok());
+    }
+
+    #[test]
+    fn mcp_approval_waits_for_and_consumes_a_decision_on_the_same_run() {
+        tauri::async_runtime::block_on(async {
+            let control = Arc::new(RuntimeControl::default());
+            let active = control.register("run-1", "session-1", true).unwrap();
+            active.register_mcp_approval("approval-1").unwrap();
+
+            let waiting_run = active.clone();
+            let waiter =
+                tokio::spawn(
+                    async move { wait_for_mcp_approval(&waiting_run, "approval-1").await },
+                );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(!waiter.is_finished());
+
+            assert!(control
+                .resolve_mcp_approval(
+                    "run-1",
+                    "approval-1",
+                    McpApprovalDecision {
+                        approve: true,
+                        reason: "Reviewed".into(),
+                    },
+                )
+                .unwrap());
+            let decision = tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(decision.approve);
+            assert_eq!(decision.reason, "Reviewed");
+            assert!(control
+                .resolve_mcp_approval(
+                    "run-1",
+                    "approval-1",
+                    McpApprovalDecision {
+                        approve: false,
+                        reason: String::new(),
+                    },
+                )
+                .unwrap_err()
+                .contains("not pending"));
+            control.unregister("run-1", &active);
+        });
     }
 
     #[test]
@@ -3010,6 +3423,37 @@ mod tests {
         assert!(
             value["output"].as_str().unwrap().chars().count() <= MAX_MODEL_TOOL_OUTPUT_CHARS + 3
         );
+    }
+
+    #[test]
+    fn responses_output_parses_mcp_approval_requests() {
+        let round = responses_round_from_output(
+            String::new(),
+            vec![json!({
+                "type": "mcp_approval_request",
+                "id": "approval-1",
+                "server_label": "project_docs",
+                "name": "search",
+                "arguments": "{\"query\":\"approval lifecycle\"}"
+            })],
+            json!({ "input_tokens": 7, "output_tokens": 3 }),
+        )
+        .unwrap();
+        assert_eq!(round.mcp_approval_requests.len(), 1);
+        let approval = &round.mcp_approval_requests[0];
+        assert_eq!(approval.id, "approval-1");
+        assert_eq!(approval.server_label, "project_docs");
+        assert_eq!(approval.name, "search");
+        assert!(approval.arguments.contains("approval lifecycle"));
+        assert_eq!(round.usage["input_tokens"], 7);
+
+        let error = responses_round_from_output(
+            String::new(),
+            vec![json!({ "type": "mcp_approval_request" })],
+            Value::Null,
+        )
+        .unwrap_err();
+        assert!(error.contains("missing id"));
     }
 
     #[test]
@@ -3355,6 +3799,7 @@ mod tests {
                 true,
                 AgentProfile::Root,
                 true,
+                &[],
             )
             .await
             .unwrap();
@@ -3366,6 +3811,7 @@ mod tests {
                 true,
                 AgentProfile::Root,
                 true,
+                &[],
             )
             .await
             .unwrap();
@@ -3377,6 +3823,7 @@ mod tests {
                 false,
                 AgentProfile::Root,
                 false,
+                &[],
             )
             .await
             .unwrap();
@@ -3410,6 +3857,55 @@ mod tests {
     }
 
     #[test]
+    fn responses_request_serializes_mcp_approval_response_for_continuation() {
+        let (endpoint, received) =
+            serve_http_sequence(vec![(200, "application/json", "{}".into())]);
+        let mut provider = provider(endpoint);
+        provider.adapter = "cc-switch-responses".into();
+        let input = vec![
+            json!({
+                "type": "mcp_approval_request",
+                "id": "approval-1",
+                "server_label": "project_docs",
+                "name": "search",
+                "arguments": "{\"query\":\"traceframe\"}"
+            }),
+            json!({
+                "type": "mcp_approval_response",
+                "approval_request_id": "approval-1",
+                "approve": false,
+                "reason": "Use the local repository instead"
+            }),
+        ];
+
+        tauri::async_runtime::block_on(async {
+            let response = send_responses_request(
+                &provider,
+                "Continue the same run",
+                &input,
+                true,
+                AgentProfile::Root,
+                true,
+                &[],
+            )
+            .await
+            .unwrap();
+            assert!(response.status().is_success());
+        });
+
+        let requests = received.recv_timeout(Duration::from_secs(1)).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["input"][1]["type"], "mcp_approval_response");
+        assert_eq!(body["input"][1]["approval_request_id"], "approval-1");
+        assert_eq!(body["input"][1]["approve"], false);
+        assert_eq!(
+            body["input"][1]["reason"],
+            "Use the local repository instead"
+        );
+    }
+
+    #[test]
     fn cc_switch_runtime_rejects_non_loopback_endpoints() {
         let mut provider = provider("https://api.example.com/v1".into());
         provider.adapter = "cc-switch-responses".into();
@@ -3420,6 +3916,7 @@ mod tests {
             true,
             AgentProfile::Root,
             true,
+            &[],
         ))
         .unwrap_err();
         assert!(error.contains("loopback"));
@@ -3522,6 +4019,9 @@ mod tests {
                 adapter: "openai-responses".into(),
                 ..provider(endpoint)
             },
+            permission_mode: None,
+            skills: Vec::new(),
+            mcp_servers: Vec::new(),
         };
         let delivered = Arc::new(Mutex::new(Vec::new()));
         let delivered_for_channel = delivered.clone();
@@ -3544,6 +4044,7 @@ mod tests {
             profile: AgentProfile::Root,
         };
         let mut budget = AgentBudget::default();
+        let mut journal = WorkspaceChangeJournal::new(&workspace).unwrap();
         let outcome = tauri::async_runtime::block_on(run_responses_agent(
             &request,
             &workspace,
@@ -3556,6 +4057,7 @@ mod tests {
             &mut sequence,
             &root_agent,
             &mut budget,
+            &mut journal,
         ))
         .unwrap()
         .unwrap();
@@ -3653,6 +4155,9 @@ mod tests {
                 adapter: "openai-responses".into(),
                 ..provider(endpoint)
             },
+            permission_mode: None,
+            skills: Vec::new(),
+            mcp_servers: Vec::new(),
         };
         let delivered = Arc::new(Mutex::new(Vec::new()));
         let delivered_for_channel = delivered.clone();
@@ -3680,6 +4185,8 @@ mod tests {
             allow_delegate: true,
             profile: AgentProfile::Root,
         };
+        let mut budget = AgentBudget::default();
+        let mut journal = WorkspaceChangeJournal::new(&workspace).unwrap();
         let outcome = tauri::async_runtime::block_on(run_responses_agent(
             &request,
             &workspace,
@@ -3691,7 +4198,8 @@ mod tests {
             &active,
             &mut sequence,
             &agent,
-            &mut AgentBudget::default(),
+            &mut budget,
+            &mut journal,
         ))
         .unwrap()
         .unwrap();
@@ -3778,6 +4286,9 @@ mod tests {
                 adapter: "openai-responses".into(),
                 ..provider(endpoint)
             },
+            permission_mode: None,
+            skills: Vec::new(),
+            mcp_servers: Vec::new(),
         };
         let channel = tauri::ipc::Channel::new(|_| Ok(()));
         let active = ActiveRun::new("session-1", true);
@@ -3792,6 +4303,7 @@ mod tests {
             profile: AgentProfile::Root,
         };
         let mut budget = AgentBudget::default();
+        let mut journal = WorkspaceChangeJournal::new(&workspace).unwrap();
 
         let outcome = tauri::async_runtime::block_on(run_responses_agent(
             &request,
@@ -3805,6 +4317,7 @@ mod tests {
             &mut sequence,
             &root_agent,
             &mut budget,
+            &mut journal,
         ))
         .unwrap()
         .unwrap();
@@ -3891,6 +4404,9 @@ mod tests {
                 adapter: "openai-responses".into(),
                 ..provider(endpoint)
             },
+            permission_mode: None,
+            skills: Vec::new(),
+            mcp_servers: Vec::new(),
         };
         let channel = tauri::ipc::Channel::new(|_| Ok(()));
         let active = ActiveRun::new("session-1", true);
@@ -3905,6 +4421,7 @@ mod tests {
             profile: AgentProfile::Root,
         };
         let mut budget = AgentBudget::default();
+        let mut journal = WorkspaceChangeJournal::new(&workspace).unwrap();
 
         let error = tauri::async_runtime::block_on(run_responses_agent(
             &request,
@@ -3918,6 +4435,7 @@ mod tests {
             &mut sequence,
             &root_agent,
             &mut budget,
+            &mut journal,
         ))
         .unwrap_err();
 
@@ -3938,6 +4456,9 @@ mod tests {
             branch: "main".into(),
             prompt: "Implement the parser".into(),
             provider: provider("http://127.0.0.1:1/v1".into()),
+            permission_mode: None,
+            skills: Vec::new(),
+            mcp_servers: Vec::new(),
         };
         let messages = vec![
             MessageRecord {

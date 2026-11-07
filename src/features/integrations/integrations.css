@@ -1,0 +1,52 @@
+.integration-settings { display: grid; gap: 24px; }
+.integration-section { display: grid; gap: 12px; }
+.integration-section + .integration-section { padding-top: 24px; border-top: 1px solid var(--line); }
+.integration-section > header, .mcp-server-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.integration-section h3 { margin: 0; color: var(--text); font-size: 13px; font-weight: 500; }
+.integration-section header p { margin: 2px 0 0; color: var(--text-muted); font-size: 10px; }
+.integration-actions, .mcp-server-title > div { display: flex; align-items: center; gap: 6px; }
+.integration-actions button, .integration-section > header > button, .mcp-server-title button { min-height: 28px; display: inline-flex; align-items: center; gap: 6px; padding: 0 9px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-panel); color: var(--text-secondary); font-size: 10px; }
+.integration-actions button:disabled, .mcp-server-title button:disabled { opacity: .45; }
+.integration-empty { margin: 0; padding: 16px; border: 1px dashed var(--line); color: var(--text-muted); font-size: 11px; text-align: center; }
+.integration-list, .mcp-list { display: grid; gap: 8px; }
+.skill-row { min-width: 0; display: grid; grid-template-columns: 16px minmax(0, 1fr) minmax(96px, 160px); align-items: center; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-panel); }
+.skill-row > span { min-width: 0; display: grid; gap: 2px; }
+.skill-row strong { color: var(--text); font-size: 11px; font-weight: 500; }
+.skill-row small, .skill-row code { overflow: hidden; color: var(--text-muted); font-size: var(--font-meta); text-overflow: ellipsis; white-space: nowrap; }
+.skill-row code { text-align: right; }
+.mcp-server { display: grid; gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-panel); }
+.mcp-enabled { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 11px; font-weight: 500; }
+.mcp-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
+.mcp-fields label { min-width: 0; display: grid; gap: 4px; }
+.mcp-fields label > span { color: var(--text-muted); font-size: var(--font-meta); }
+.mcp-fields input, .mcp-fields select { min-width: 0; height: 30px; padding: 0 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface-deep); color: var(--text); font: 10px/1.2 'IBM Plex Sans', sans-serif; }
+.mcp-fields .mcp-url, .mcp-fields .mcp-token { grid-column: 1 / -1; }
+.integration-status, .mcp-warning { display: flex; align-items: flex-start; gap: 6px; margin: 0; color: var(--text-muted); font-size: 10px; line-height: 16px; }
+.integration-status svg, .mcp-warning svg { flex: 0 0 auto; margin-top: 1px; }
+.integration-status.is-ok { color: var(--success); }
+.integration-status.is-error, .mcp-warning { color: var(--danger); }
+@media (max-width: 760px) { .mcp-fields { grid-template-columns: minmax(0, 1fr); } .mcp-fields .mcp-url, .mcp-fields .mcp-token { grid-column: 1; } .skill-row { grid-template-columns: 16px minmax(0, 1fr); } .skill-row code { grid-column: 2; text-align: left; } }
+
+.mcp-approval-list { display: grid; gap: 8px; }
+.mcp-approval { overflow: hidden; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface-panel); }
+.mcp-approval-header { min-height: 44px; display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.mcp-approval-mark { width: 28px; height: 28px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 5px; color: var(--text-secondary); }
+.mcp-approval-title { min-width: 0; display: grid; gap: 2px; }
+.mcp-approval-title strong { overflow: hidden; color: var(--text); font: 500 11px/16px 'IBM Plex Mono', monospace; text-overflow: ellipsis; white-space: nowrap; }
+.mcp-approval-title small { display: flex; align-items: center; gap: 4px; overflow: hidden; color: var(--text-muted); font-size: var(--font-meta); line-height: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.mcp-approval-status { color: var(--text-secondary); font-size: var(--font-meta); white-space: nowrap; }
+.mcp-approval.is-approved .mcp-approval-status { color: var(--success); }
+.mcp-approval.is-rejected .mcp-approval-status { color: var(--danger); }
+.mcp-approval-context { display: grid; grid-template-columns: 48px minmax(0, 1fr); gap: 4px 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: var(--font-meta); }
+.mcp-approval-context span { color: var(--text-muted); }
+.mcp-approval-context code { overflow: hidden; color: var(--text-secondary); text-overflow: ellipsis; white-space: nowrap; }
+.mcp-approval-arguments > summary { height: 28px; display: flex; align-items: center; padding: 0 12px; color: var(--text-muted); cursor: pointer; font-size: var(--font-meta); list-style: none; }
+.mcp-approval-arguments > summary::-webkit-details-marker { display: none; }
+.mcp-approval-arguments pre { max-height: 240px; margin: 0; padding: 12px; overflow: auto; border-top: 1px solid var(--line); background: var(--surface-deep); color: var(--text-secondary); font: 10px/16px 'IBM Plex Mono', monospace; tab-size: 2; white-space: pre-wrap; overflow-wrap: anywhere; }
+.mcp-approval-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 8px 12px; border-top: 1px solid var(--line); }
+.mcp-approval-actions button { height: 28px; display: inline-flex; align-items: center; gap: 6px; padding: 0 10px; border: 1px solid var(--line); border-radius: 5px; background: transparent; color: var(--text-secondary); cursor: pointer; font-size: 10px; }
+.mcp-approval-actions button:hover:not(:disabled) { border-color: var(--line-strong); color: var(--text); }
+.mcp-approval-actions button.is-allow { border-color: transparent; background: var(--text); color: var(--surface-deep); }
+.mcp-approval-actions button:disabled { cursor: wait; opacity: .52; }
+.mcp-approval-error, .mcp-approval-reason { margin: 0; padding: 8px 12px; border-top: 1px solid var(--line); color: var(--danger); font-size: 10px; line-height: 16px; }
+.mcp-approval-reason { color: var(--text-muted); }

@@ -1,5 +1,7 @@
 import { Channel, invoke } from '@tauri-apps/api/core'
 import type { MemoryRecord, Message, Provider, RuntimeEventRecord, RuntimeEventType, Session } from './types'
+import type { PermissionMode } from './features/approvals'
+import type { RemoteMcpServer, SkillDescriptor } from './features/integrations'
 
 export interface NativeCapabilities {
   platform: string
@@ -293,7 +295,17 @@ export async function testNativeProvider(provider: Provider) {
 }
 
 export async function startNativeRun(
-  request: { runId: string; sessionId: string; workspacePath: string; branch: string; prompt: string; provider: Provider },
+  request: {
+    runId: string
+    sessionId: string
+    workspacePath: string
+    branch: string
+    prompt: string
+    provider: Provider
+    permissionMode: PermissionMode
+    skills: SkillDescriptor[]
+    mcpServers: RemoteMcpServer[]
+  },
   onEvent: (event: RuntimeEventRecord) => void,
 ) {
   const channel = new Channel<RuntimeEventRecord>()

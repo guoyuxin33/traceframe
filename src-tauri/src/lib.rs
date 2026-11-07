@@ -13,17 +13,24 @@ use std::time::{Duration, Instant};
 use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
+mod git_graph;
+mod integrations;
 mod preview;
 mod preview_proxy;
 mod runtime;
 mod store;
 mod terminal;
 
+use git_graph::git_graph;
+use integrations::{discover_skills, mcp_healthcheck, pick_skill_directory};
 use preview::{
     preview_fetch_document, preview_logs, preview_proxy_open, preview_restart, preview_start,
     preview_start_stream, preview_status, preview_stop, PreviewManager,
 };
-use runtime::{provider_healthcheck, runtime_cancel, runtime_start, runtime_steer, RuntimeControl};
+use runtime::{
+    approval_batches, approval_decide, mcp_approval_decide, provider_healthcheck, runtime_cancel,
+    runtime_start, runtime_steer, RuntimeControl,
+};
 use store::{
     app_snapshot, append_message, archive_session, compact_session, create_session, delete_memory,
     save_memory, session_events, update_memory, update_session_scope, AppStore,
@@ -1438,6 +1445,7 @@ pub fn run() {
             git_snapshot,
             git_branches,
             git_history,
+            git_graph,
             git_switch_branch,
             git_create_branch,
             git_stage_all,
@@ -1460,6 +1468,12 @@ pub fn run() {
             delete_memory,
             compact_session,
             provider_healthcheck,
+            pick_skill_directory,
+            discover_skills,
+            mcp_healthcheck,
+            approval_batches,
+            approval_decide,
+            mcp_approval_decide,
             runtime_start,
             runtime_cancel,
             runtime_steer,

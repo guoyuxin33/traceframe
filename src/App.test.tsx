@@ -1,8 +1,9 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import { act, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { Actions, DockLocation, type TabNode } from 'flexlayout-react'
 import {
   AppRail,
   AgentPanel,
@@ -42,6 +43,9 @@ import {
 } from './App'
 import type { Provider, Session } from './types'
 import type { RuntimeEventRecord } from './types'
+import type { GitGraphSnapshot } from './features/git-graph'
+import { DOCK_COMPONENTS, hiddenDockComponents, persistDockModel, showOrRestoreDockComponent } from './features/workspace-layout/dockModel'
+import { McpApproval } from './features/integrations'
 
 const sessions: Session[] = [
   { id: 'archived', title: 'Archived', summary: '', time: '', branch: 'main', archived: true },
@@ -99,6 +103,8 @@ describe('dock layout schema migration', () => {
     expect(preview?.getParent()).toBe(model.getNodeById('code')?.getParent())
     expect(terminal?.getParent()).toBe(model.getNodeById('output')?.getParent())
     expect((model.toJson().layout as { children: Array<{ weight?: number }> }).children[0].weight).toBe(31)
+    expect((preview as TabNode).isEnableClose()).toBe(true)
+    expect((preview as TabNode).isEnableDrag()).toBe(true)
 
     const stored = JSON.parse(localStorage.getItem(DOCK_LAYOUT_STORAGE_KEY)!)
     expect(stored.schemaVersion).toBe(DOCK_LAYOUT_SCHEMA_VERSION)
@@ -106,18 +112,83 @@ describe('dock layout schema migration', () => {
     expect(JSON.stringify(stored.model)).toContain('"component":"terminal"')
   })
 
-  it('repairs stale same-key schemas and resets structurally incomplete layouts', () => {
+  it('repairs stale same-key schemas and preserves panels minimized by the current schema', () => {
     const stale = legacyDockLayout(new Set(['preview']))
     localStorage.setItem(DOCK_LAYOUT_STORAGE_KEY, JSON.stringify({ schemaVersion: 4, model: stale }))
     expect(storedDockModel('balanced').getNodeById('preview')).toBeTruthy()
 
     localStorage.clear()
-    const corrupt = legacyDockLayout(new Set(['conversation', 'preview', 'terminal']))
-    localStorage.setItem(DOCK_LAYOUT_STORAGE_KEY, JSON.stringify({ schemaVersion: DOCK_LAYOUT_SCHEMA_VERSION, model: corrupt }))
-    const reset = storedDockModel('conversation')
-    expect(reset.getNodeById('conversation')).toBeTruthy()
-    expect(reset.getNodeById('preview')).toBeTruthy()
-    expect(reset.getNodeById('terminal')).toBeTruthy()
+    const minimized = legacyDockLayout(new Set(['conversation', 'preview', 'terminal']))
+    localStorage.setItem(DOCK_LAYOUT_STORAGE_KEY, JSON.stringify({ schemaVersion: DOCK_LAYOUT_SCHEMA_VERSION, model: minimized }))
+    const restored = storedDockModel('conversation')
+    expect(hiddenDockComponents(restored)).toEqual(expect.arrayContaining(['conversation', 'preview', 'terminal']))
+
+    showOrRestoreDockComponent(restored, 'preview')
+    persistDockModel(restored)
+    const reloaded = storedDockModel('balanced')
+    expect(reloaded.getNodeById('preview')).toBeTruthy()
+    expect(reloaded.getNodeById('preview')?.getParent()).toBe(reloaded.getNodeById('code')?.getParent())
+    expect(hiddenDockComponents(reloaded)).toEqual(expect.arrayContaining(['conversation', 'terminal']))
+  })
+
+  it('preserves v6 minimized panels and falls back to the functional group without a recorded location', () => {
+    const minimized = legacyDockLayout(new Set(['preview']))
+    localStorage.setItem(DOCK_LAYOUT_STORAGE_KEY, JSON.stringify({ schemaVersion: 6, model: minimized }))
+
+    const model = storedDockModel('balanced')
+    expect(model.getNodeById('preview')).toBeUndefined()
+    showOrRestoreDockComponent(model, 'preview')
+    expect(model.getNodeById('preview')?.getParent()).toBe(model.getNodeById('code')?.getParent())
+  })
+
+  it('persists a moved panel restore target across close and reload', () => {
+    const model = storedDockModel('balanced')
+    const targetId = model.getNodeById('sessions')!.getParent()!.getId()
+    model.doAction(Actions.moveNode('preview', targetId, DockLocation.CENTER, -1, true))
+    persistDockModel(model)
+    model.doAction(Actions.deleteTab('preview'))
+    persistDockModel(model)
+
+    const reloaded = storedDockModel('balanced')
+    showOrRestoreDockComponent(reloaded, 'preview')
+    expect(reloaded.getNodeById('preview')?.getParent()?.getId()).toBe(targetId)
+  })
+
+  it('reuses an empty remembered tabset and falls back if that tabset is later removed', () => {
+    const model = storedDockModel('balanced')
+    const conversationTabsetId = model.getNodeById('conversation')!.getParent()!.getId()
+    persistDockModel(model)
+    model.doAction(Actions.deleteTab('conversation'))
+    persistDockModel(model)
+    expect(model.getNodeById(conversationTabsetId)).toBeTruthy()
+
+    showOrRestoreDockComponent(model, 'conversation')
+    expect(model.getNodeById('conversation')?.getParent()?.getId()).toBe(conversationTabsetId)
+
+    model.doAction(Actions.deleteTab('conversation'))
+    model.doAction(Actions.deleteTabset(conversationTabsetId))
+    persistDockModel(model)
+    expect(model.getNodeById(conversationTabsetId)).toBeUndefined()
+
+    showOrRestoreDockComponent(model, 'conversation')
+    expect(model.getNodeById('conversation')).toBeTruthy()
+    expect(model.getNodeById('conversation')?.getParent()?.getId()).not.toBe(conversationTabsetId)
+  })
+
+  it('enables tab dragging, closing, and splitter resizing in every preset', () => {
+    const layout = dockLayoutJson('balanced')
+    expect(layout.global).toMatchObject({ tabEnableClose: true, tabEnableDrag: true })
+  })
+
+  it('can restore a panel after every panel was minimized and the layout reloaded', () => {
+    const model = storedDockModel('balanced')
+    DOCK_COMPONENTS.forEach((component) => model.doAction(Actions.deleteTab(component)))
+    persistDockModel(model)
+
+    const reloaded = storedDockModel('balanced')
+    expect(hiddenDockComponents(reloaded)).toHaveLength(DOCK_COMPONENTS.length)
+    showOrRestoreDockComponent(reloaded, 'conversation')
+    expect(reloaded.getNodeById('conversation')).toBeTruthy()
   })
 
   it('does not overwrite a layout written by a newer app schema', () => {
@@ -194,6 +265,37 @@ describe('conversation controls', () => {
 
     view.rerender(<ConversationPanel session={{ ...activeSession, id: 'second' }} messages={[]} agents={[]} disabled={false} onSend={vi.fn().mockResolvedValue(true)} />)
     await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(2))
+  })
+
+  it('stops following while the user reads older messages and resumes on request', async () => {
+    const user = userEvent.setup()
+    const scrollIntoView = vi.fn()
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: scrollIntoView })
+    const firstMessage = { id: 'message-1', author: 'User', role: 'user' as const, time: '10:00', body: 'First', createdAt: 100 }
+    const view = render(<ConversationPanel session={activeSession} messages={[firstMessage]} agents={[]} disabled={false} onSend={vi.fn().mockResolvedValue(true)} />)
+    await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1))
+
+    const stream = document.querySelector<HTMLElement>('.message-stream')!
+    Object.defineProperties(stream, {
+      scrollHeight: { configurable: true, value: 1_000 },
+      clientHeight: { configurable: true, value: 300 },
+      scrollTop: { configurable: true, writable: true, value: 100 },
+    })
+    fireEvent.scroll(stream)
+    expect(screen.getByRole('button', { name: 'Latest' })).toBeVisible()
+
+    view.rerender(<ConversationPanel
+      session={activeSession}
+      messages={[firstMessage, { ...firstMessage, id: 'message-2', body: 'Second', createdAt: 200 }]}
+      agents={[]}
+      disabled={false}
+      onSend={vi.fn().mockResolvedValue(true)}
+    />)
+    expect(scrollIntoView).toHaveBeenCalledTimes(1)
+
+    await user.click(screen.getByRole('button', { name: 'Latest' }))
+    expect(scrollIntoView).toHaveBeenCalledTimes(2)
+    expect(screen.queryByRole('button', { name: 'Latest' })).not.toBeInTheDocument()
   })
 
   it('keeps drafts isolated per session and clears only after a successful send', async () => {
@@ -389,11 +491,54 @@ describe('execution evidence', () => {
     expect(tool).toMatchObject({ status: 'completed', output: '39 tests passed', durationMs: 45 })
     expect(tool?.files).toEqual([{ path: 'src/App.tsx', startLine: 10, endLine: 12 }])
     expect(agent).toHaveLength(1)
-    expect(agent[0]).toMatchObject({ status: 'completed', summary: 'No blocking findings' })
+    expect(agent[0]).toMatchObject({ status: 'completed', summary: 'Inspect the patch', output: 'No blocking findings' })
+  })
+
+  it('keeps file and MCP approval lifecycles as inspectable execution steps', () => {
+    const approvalEvents = [
+      runtimeEvent(1, 'approval.requested', { id: 'batch-1', status: 'pending', files: [{ path: 'src/App.tsx' }] }),
+      runtimeEvent(2, 'approval.resolved', { id: 'batch-1', status: 'accepted', files: [{ path: 'src/App.tsx' }] }),
+      runtimeEvent(3, 'mcp.approval.requested', { approvalRequestId: 'mcp-1', serverLabel: 'docs', name: 'search', arguments: '{"query":"Traceframe"}' }),
+      runtimeEvent(4, 'mcp.approval.resolved', { approvalRequestId: 'mcp-1', serverLabel: 'docs', name: 'search', approve: true }),
+    ] satisfies RuntimeEventRecord[]
+
+    expect(executionSteps(approvalEvents)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'approval:batch-1', title: 'File review completed', status: 'completed' }),
+      expect.objectContaining({ id: 'approval:mcp:mcp-1', title: 'MCP tool decision', status: 'completed' }),
+    ]))
   })
 
   it('describes the active command instead of a generic running label', () => {
     expect(currentExecutionSummary(events.slice(0, 3), 'run-1')).toBe('Run command · npm test')
+  })
+
+  it('removes repeated tool names from execution summaries', () => {
+    const repeatedProgram = runtimeEvent(3, 'tool.started', {
+      item: { callId: 'call-rg', name: 'run_command', arguments: '{"program":"rg","args":["rg","-n","Traceframe"]}' },
+    })
+    const repeatedTitle = runtimeEvent(4, 'tool.started', {
+      item: { callId: 'call-list', name: 'list_files', arguments: '{}' },
+    })
+
+    expect(executionSteps([repeatedProgram])[0].summary).toBe('rg -n Traceframe')
+    expect(currentExecutionSummary([repeatedTitle], 'run-1')).toBe('List files')
+  })
+
+  it('keeps delegated agent Markdown out of the collapsed label and renders it in Result', async () => {
+    const user = userEvent.setup()
+    const markdownEvents = [
+      runtimeEvent(1, 'run.created', { provider: 'CC Switch', model: 'gpt-current' }),
+      runtimeEvent(2, 'agent.started', { agentId: 'reviewer', name: 'Reviewer', task: 'Inspect the patch' }),
+      runtimeEvent(3, 'agent.completed', { agentId: 'reviewer', name: 'Reviewer', status: 'completed', result: '## Findings\n\n- No blockers' }),
+      runtimeEvent(4, 'run.completed', { rounds: 1 }),
+    ] satisfies RuntimeEventRecord[]
+    render(<ConversationPanel session={activeSession} messages={[]} agents={[]} disabled={false} events={markdownEvents} onSend={vi.fn().mockResolvedValue(true)} />)
+
+    const disclosure = screen.getByRole('group', { name: /Agent · Reviewer: Inspect the patch/ })
+    expect(disclosure).not.toHaveAccessibleName(/No blockers/)
+    await user.click(disclosure.querySelector('summary') as HTMLElement)
+    expect(screen.getByRole('heading', { name: 'Findings' })).toBeVisible()
+    expect(screen.getByText('No blockers')).toBeVisible()
   })
 
   it('renders collapsible arguments, results, and clickable file evidence in Conversation', async () => {
@@ -416,6 +561,82 @@ describe('execution evidence', () => {
     expect(onOpenExecutionFile).toHaveBeenCalledWith('src/App.tsx')
   })
 
+  it('places each run between the user request and the later agent response', () => {
+    const runStart = events[0].timestamp
+    render(<ConversationPanel
+      session={activeSession}
+      messages={[
+        { id: 'request', author: 'GX', role: 'user', time: '10:00', body: 'Run the tests', createdAt: runStart - 10 },
+        { id: 'response', author: 'Agent', role: 'agent', time: '10:01', body: 'All tests passed', createdAt: runStart + 100 },
+      ]}
+      agents={[]}
+      disabled={false}
+      events={events}
+      onSend={vi.fn().mockResolvedValue(true)}
+    />)
+
+    const request = screen.getByText('Run the tests').closest('article')!
+    const run = screen.getByRole('region', { name: '运行执行步骤' })
+    const response = screen.getByText('All tests passed').closest('article')!
+    expect(request.compareDocumentPosition(run) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(run.compareDocumentPosition(response) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('renders an actionable MCP approval inside the corresponding run segment', async () => {
+    const user = userEvent.setup()
+    const decide = vi.fn().mockResolvedValue(true)
+    const approvalEvents = [
+      runtimeEvent(1, 'run.created', { provider: 'CC Switch', model: 'gpt-current' }),
+      runtimeEvent(2, 'mcp.approval.requested', {
+        approvalRequestId: 'mcp-1', serverLabel: 'docs_server', name: 'search_docs', arguments: '{"query":"approval"}',
+      }),
+    ] satisfies RuntimeEventRecord[]
+    const runStart = approvalEvents[0].timestamp
+    render(<ConversationPanel
+      session={activeSession}
+      messages={[
+        { id: 'request', author: 'GX', role: 'user', time: '10:00', body: 'Search the docs', createdAt: runStart - 10 },
+        { id: 'response', author: 'Agent', role: 'agent', time: '10:01', body: 'Waiting', createdAt: runStart + 100 },
+      ]}
+      agents={[]}
+      disabled={false}
+      events={approvalEvents}
+      renderRunApprovals={(segmentEvents) => <McpApproval events={segmentEvents} decide={decide} />}
+      onSend={vi.fn().mockResolvedValue(true)}
+    />)
+
+    const request = screen.getByText('Search the docs').closest('article')!
+    const approval = screen.getByLabelText('Approval for docs_server search_docs')
+    const response = screen.getByText('Waiting').closest('article')!
+    expect(request.compareDocumentPosition(approval) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(approval.compareDocumentPosition(response) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    await user.click(screen.getByRole('button', { name: 'Allow tool' }))
+    await waitFor(() => expect(decide).toHaveBeenCalledWith({ runId: 'run-1', approvalRequestId: 'mcp-1', approve: true }))
+  })
+
+  it('continues a running timeline after an inline guidance message', () => {
+    const runStart = events[0].timestamp
+    const guidanceTime = events[3].timestamp
+    render(<ConversationPanel
+      session={activeSession}
+      messages={[
+        { id: 'request', author: 'GX', role: 'user', time: '10:00', body: 'Start the work', createdAt: runStart - 10 },
+        { id: 'guidance', author: 'GX', role: 'user', time: '10:01', body: 'Check the changed file too', createdAt: guidanceTime },
+        { id: 'response', author: 'Agent', role: 'agent', time: '10:02', body: 'Finished', createdAt: events.at(-1)!.timestamp + 10 },
+      ]}
+      agents={[]}
+      disabled={false}
+      events={events}
+      onSend={vi.fn().mockResolvedValue(true)}
+    />)
+
+    const runs = screen.getAllByRole('region', { name: '运行执行步骤' })
+    const guidance = screen.getByText('Check the changed file too').closest('article')!
+    expect(runs).toHaveLength(2)
+    expect(runs[0].compareDocumentPosition(guidance) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(guidance.compareDocumentPosition(runs[1]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
   it('expands and collapses every execution step from the timeline controls', async () => {
     const user = userEvent.setup()
     render(<ConversationPanel
@@ -433,7 +654,7 @@ describe('execution evidence', () => {
 
     await user.click(screen.getByRole('button', { name: 'Expand all execution steps' }))
     expect(disclosures.every((element) => element.hasAttribute('open'))).toBe(true)
-    expect(screen.getByText('#3')).toBeVisible()
+    expect(screen.getByText('#2')).toBeVisible()
 
     await user.click(screen.getByRole('button', { name: 'Collapse all execution steps' }))
     expect(disclosures.every((element) => !element.hasAttribute('open'))).toBe(true)
@@ -476,6 +697,20 @@ describe('execution evidence', () => {
 })
 
 describe('source control panel', () => {
+  const graphSnapshot: GitGraphSnapshot = {
+    head: 'graph-head',
+    currentBranch: 'main',
+    truncated: false,
+    commits: [
+      { hash: 'graph-head', shortHash: 'aaabbbb', parents: ['graph-base'], author: 'Ada', authoredAt: '2026-11-07T09:04:00Z', subject: 'graph head' },
+      { hash: 'graph-base', shortHash: 'cccdddd', parents: [], author: 'Lin', authoredAt: '2026-11-07T09:03:00Z', subject: 'graph base' },
+    ],
+    refs: [
+      { name: 'HEAD', fullName: 'HEAD', hash: 'graph-head', kind: 'head', isCurrent: true, symbolicTarget: 'refs/heads/main' },
+      { name: 'main', fullName: 'refs/heads/main', hash: 'graph-head', kind: 'local', isCurrent: true, symbolicTarget: null },
+    ],
+  }
+
   const gitWorkspace = {
     ...workspace,
     branches: ['main', 'review'],
@@ -560,6 +795,25 @@ describe('source control panel', () => {
     expect(screen.getByRole('button', { name: '会话' })).toHaveAttribute('aria-pressed', 'false')
   })
 
+  it('keeps minimized panels discoverable in the rail and exposes layout reset', async () => {
+    const user = userEvent.setup()
+    const onShowDock = vi.fn()
+    const onResetLayout = vi.fn()
+    render(<AppRail
+      changeCount={0}
+      hiddenPanels={['preview', 'terminal']}
+      onShowSessions={vi.fn()}
+      onShowDock={onShowDock}
+      onResetLayout={onResetLayout}
+    />)
+
+    await user.click(screen.getByRole('button', { name: 'Restore Preview' }))
+    await user.click(screen.getByRole('button', { name: '重置工作区布局' }))
+    expect(onShowDock).toHaveBeenCalledWith('preview')
+    expect(screen.getByRole('button', { name: 'Restore Terminal' })).toBeVisible()
+    expect(onResetLayout).toHaveBeenCalledTimes(1)
+  })
+
   it('keeps changes, history, and branch controls in independent disclosures', () => {
     render(<GitPanel {...gitProps()} />)
 
@@ -581,6 +835,22 @@ describe('source control panel', () => {
     expect(screen.getByText('Traceframe Test')).toBeVisible()
     expect(screen.getByText('origin/main')).toBeVisible()
     expect(screen.getByText('4e8798f9e0c5bdaf9e6b467d218389c0d07b4576')).toBeVisible()
+  })
+
+  it('links commit graph selection to detailed commit evidence', async () => {
+    const user = userEvent.setup()
+    render(<GitPanel {...gitProps()} loadGraph={async () => graphSnapshot} />)
+
+    await user.click(screen.getByText('History'))
+    const base = await screen.findByRole('button', { name: 'Select commit cccdddd: graph base' })
+    await user.click(base)
+
+    expect(base).toHaveAttribute('aria-pressed', 'true')
+    const details = screen.getByRole('region', { name: 'Selected commit details' })
+    expect(details).toHaveTextContent('graph base')
+    expect(details).toHaveTextContent('Lin')
+    expect(details).toHaveTextContent('graph-base')
+    expect(details).toHaveTextContent('Root commit')
   })
 
   it('locks every mutating Git control while an agent run owns the workspace', async () => {
@@ -1088,9 +1358,43 @@ describe('provider configuration', () => {
     expect(onSave).toHaveBeenCalledWith(
       [provider],
       { theme: 'light', density: 'comfortable', layout: 'code' },
+      { skillRoots: [], skills: [], mcpServers: [] },
+      'request-approval',
       true,
     )
     expect(onClose).toHaveBeenCalledTimes(1)
+  })
+
+  it('saves agent permissions and integration configuration from Agent & tools', async () => {
+    const user = userEvent.setup()
+    const onSave = vi.fn()
+    const integrations = {
+      skillRoots: ['/skills'],
+      skills: [{ id: 'review', name: 'Review', description: 'Review changes', path: '/skills/review/SKILL.md', sourceRoot: '/skills', enabled: true }],
+      mcpServers: [],
+    }
+    render(<ProviderSettings
+      open
+      providers={[provider]}
+      preferences={{ theme: 'graphite', density: 'compact', layout: 'balanced' }}
+      integrations={integrations}
+      permissionMode="request-approval"
+      onClose={vi.fn()}
+      onSave={onSave}
+    />)
+
+    await user.click(screen.getByRole('button', { name: 'Agent & tools' }))
+    expect(screen.getByRole('heading', { name: 'Skills' })).toBeVisible()
+    expect(screen.getByText('Review')).toBeVisible()
+    await user.click(screen.getByLabelText('Full access'))
+    await user.click(screen.getByRole('button', { name: 'Save settings' }))
+    expect(onSave).toHaveBeenCalledWith(
+      [provider],
+      { theme: 'graphite', density: 'compact', layout: 'balanced' },
+      integrations,
+      'full-access',
+      false,
+    )
   })
 })
 

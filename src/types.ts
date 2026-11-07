@@ -83,6 +83,10 @@ export type RuntimeEventType =
   | 'tool.completed'
   | 'tool.failed'
   | 'file.changed'
+  | 'approval.requested'
+  | 'approval.resolved'
+  | 'mcp.approval.requested'
+  | 'mcp.approval.resolved'
   | 'context.compacted'
 
 export interface RuntimeEventRecord {
