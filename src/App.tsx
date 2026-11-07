@@ -1306,6 +1306,29 @@ export function untrackedFileDiff(file: WorkspaceFile) {
   ].join('\n')
 }
 
+function compactByteSize(bytes: number) {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(bytes >= 10 * 1024 * 1024 ? 0 : 1)} MB`
+  if (bytes >= 1024) return `${Math.ceil(bytes / 1024).toLocaleString()} KB`
+  return `${bytes.toLocaleString()} B`
+}
+
+function contentLineCount(content: string) {
+  if (!content) return 0
+  return content.split('\n').length - (content.endsWith('\n') ? 1 : 0)
+}
+
+export function filePreviewNotice(file: WorkspaceFile) {
+  if (!file.truncated) return ''
+  const previewLines = file.previewLines ?? contentLineCount(file.content)
+  const previewBytes = file.previewBytes ?? new TextEncoder().encode(file.content).length
+  const reason = file.truncationReason === 'lines'
+    ? 'line safety limit'
+    : file.truncationReason === 'bytes-and-lines'
+      ? 'line and size safety limits'
+      : 'size safety limit'
+  return `Showing first ${previewLines.toLocaleString()} lines · ${compactByteSize(previewBytes)} of ${compactByteSize(file.size)} · ${reason}`
+}
+
 export function FileTree({
   workspace,
   selected,
@@ -1462,10 +1485,12 @@ export function CodeView({
   const editorRef = useRef<HTMLTextAreaElement>(null)
   const viewerRef = useRef<HTMLDivElement>(null)
   const [tabMovesFocus, setTabMovesFocus] = useState(false)
-  const content = file ? draftPath === file.path ? draft : file.content : ''
+  const effectiveMode: EditorMode = mode === 'edit' && canEdit ? 'edit' : 'view'
+  const content = file ? !file.truncated && draftPath === file.path ? draft : file.content : ''
   const contentRef = useRef(content)
   contentRef.current = content
   const lines = content.split('\n')
+  const displayedLineCount = file?.truncated && file.previewLines !== undefined ? file.previewLines : contentLineCount(content)
   const activeEdit = file && agentEdit?.path === file.path ? agentEdit : null
 
   useEffect(() => {
@@ -1474,7 +1499,7 @@ export function CodeView({
     const startLine = Math.min(activeEdit.startLine, currentLines.length)
     const endLine = Math.min(Math.max(activeEdit.endLine, startLine), currentLines.length)
     const frame = requestAnimationFrame(() => {
-      if (mode === 'edit' && canEdit && editorRef.current) {
+      if (effectiveMode === 'edit' && editorRef.current) {
         const beforeStart = currentLines.slice(0, startLine - 1).join('\n')
         const startOffset = beforeStart.length + (startLine > 1 ? 1 : 0)
         editorRef.current.setSelectionRange(startOffset, startOffset)
@@ -1486,20 +1511,20 @@ export function CodeView({
       if (line && typeof line.scrollIntoView === 'function') line.scrollIntoView({ block: 'center' })
     })
     return () => cancelAnimationFrame(frame)
-  }, [activeEdit?.eventId, canEdit, file?.path, mode])
+  }, [activeEdit?.eventId, effectiveMode, file?.path])
 
   if (loading) return <div className="workspace-empty"><RefreshCw className="is-spinning" size={18} /><strong>Reading file</strong></div>
   if (error && !file) return <div className="workspace-empty is-error"><File size={18} /><strong>Preview unavailable</strong><p>{error}</p></div>
   if (!file) return <div className="workspace-empty"><FileCode2 size={18} /><strong>Select a file</strong><p>Code and diffs stay tied to the selected workspace.</p></div>
 
   return (
-    <div className={`code-editor mode-${mode}`} role="region" aria-label="代码编辑器">
+    <div className={`code-editor mode-${effectiveMode}`} role="region" aria-label="代码编辑器">
       <div className="code-editor-toolbar">
         <div className="editor-mode-toggle" role="group" aria-label="编辑器模式">
-          <button type="button" className={mode === 'view' ? 'is-active' : ''} aria-pressed={mode === 'view'} onClick={() => onMode('view')} disabled={saving}>View</button>
-          <button type="button" className={mode === 'edit' ? 'is-active' : ''} aria-pressed={mode === 'edit'} onClick={() => onMode('edit')} disabled={!canEdit || saving}>Edit</button>
+          <button type="button" className={effectiveMode === 'view' ? 'is-active' : ''} aria-pressed={effectiveMode === 'view'} onClick={() => onMode('view')} disabled={saving}>View</button>
+          <button type="button" className={effectiveMode === 'edit' ? 'is-active' : ''} aria-pressed={effectiveMode === 'edit'} onClick={() => onMode('edit')} disabled={!canEdit || saving}>Edit</button>
         </div>
-        <span className={`editor-file-state${dirty ? ' is-dirty' : ''}`}>{dirty ? 'Unsaved changes' : activeEdit ? `Agent edit · L${activeEdit.startLine}${activeEdit.endLine > activeEdit.startLine ? `–${activeEdit.endLine}` : ''}` : file.truncated ? 'Read only' : 'Saved'}</span>
+        <span className={`editor-file-state${dirty ? ' is-dirty' : ''}`}>{file.truncated ? dirty ? 'Read only · unsaved draft retained' : 'Read only' : dirty ? 'Unsaved changes' : activeEdit ? `Agent edit · L${activeEdit.startLine}${activeEdit.endLine > activeEdit.startLine ? `–${activeEdit.endLine}` : ''}` : 'Saved'}</span>
         <div className="editor-actions">
           <button className={`editor-follow${followAgent ? ' is-active' : ''}${followBlocked ? ' is-blocked' : ''}`} type="button" aria-pressed={followAgent} onClick={() => onFollowAgent(!followAgent)} title={followBlocked ? 'Save or revert local changes before following the agent' : followAgent ? 'Pause automatic agent navigation' : 'Follow the latest agent edit'}>
             <Crosshair size={14} />
@@ -1514,8 +1539,8 @@ export function CodeView({
         </div>
       </div>
       {saveError || error ? <div className="editor-error" role="alert">{saveError ?? error}</div> : null}
-      {file.truncated ? <div className="file-preview-note">Preview limited for responsiveness · source size {(file.size / 1024).toFixed(0)} KB</div> : null}
-      {mode === 'edit' && canEdit ? (
+      {file.truncated ? <div className="file-preview-note">{filePreviewNotice(file)}</div> : null}
+      {effectiveMode === 'edit' ? (
         <div className="code-editor-input">
           <pre className="editor-gutter" ref={gutterRef} aria-hidden="true">{lines.map((_, index) => index + 1).join('\n')}</pre>
           <textarea
@@ -1556,7 +1581,7 @@ export function CodeView({
           ))}
         </div>
       )}
-      <div className="code-editor-status"><span>{lines.length} lines</span><span>{content.length.toLocaleString()} chars</span><span>UTF-8</span><span>{mode === 'edit' ? dirty ? 'Modified' : 'Editing' : 'Viewing'}</span></div>
+      <div className="code-editor-status"><span>{displayedLineCount.toLocaleString()} {displayedLineCount === 1 ? 'line' : 'lines'}</span><span>{content.length.toLocaleString()} chars</span><span>UTF-8</span><span>{effectiveMode === 'edit' ? dirty ? 'Modified' : 'Editing' : 'Viewing'}</span></div>
     </div>
   )
 }

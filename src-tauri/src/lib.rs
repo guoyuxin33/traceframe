@@ -34,8 +34,8 @@ use terminal::{
 
 const MAX_TREE_ENTRIES: usize = 800;
 const MAX_TREE_DEPTH: usize = 6;
-const MAX_FILE_PREVIEW_BYTES: usize = 512 * 1024;
-const MAX_FILE_PREVIEW_LINES: usize = 4_000;
+const MAX_FILE_PREVIEW_BYTES: usize = 1024 * 1024;
+const MAX_FILE_PREVIEW_LINES: usize = 12_000;
 const MAX_GIT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_GIT_ERROR_BYTES: usize = 64 * 1024;
 const MAX_DIFF_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
@@ -128,6 +128,9 @@ struct WorkspaceFile {
     content: String,
     size: u64,
     truncated: bool,
+    preview_bytes: usize,
+    preview_lines: usize,
+    truncation_reason: Option<String>,
 }
 
 fn canonical_workspace(path: &str) -> Result<PathBuf, String> {
@@ -1081,14 +1084,14 @@ fn read_workspace_file_at(
     if bytes.contains(&0) {
         return Err("Binary files cannot be previewed".into());
     }
-    let mut truncated =
+    let byte_truncated =
         size > MAX_FILE_PREVIEW_BYTES as u64 || bytes.len() > MAX_FILE_PREVIEW_BYTES;
-    if truncated {
+    if byte_truncated {
         bytes.truncate(MAX_FILE_PREVIEW_BYTES);
     }
     let decoded = match String::from_utf8(bytes) {
         Ok(decoded) => decoded,
-        Err(error) if truncated && error.utf8_error().error_len().is_none() => {
+        Err(error) if byte_truncated && error.utf8_error().error_len().is_none() => {
             let valid_up_to = error.utf8_error().valid_up_to();
             let mut bytes = error.into_bytes();
             bytes.truncate(valid_up_to);
@@ -1102,13 +1105,24 @@ fn read_workspace_file_at(
         .by_ref()
         .take(MAX_FILE_PREVIEW_LINES)
         .collect::<String>();
-    truncated |= lines.next().is_some();
+    let line_truncated = lines.next().is_some();
+    let truncation_reason = match (byte_truncated, line_truncated) {
+        (true, true) => Some("bytes-and-lines".to_string()),
+        (true, false) => Some("bytes".to_string()),
+        (false, true) => Some("lines".to_string()),
+        (false, false) => None,
+    };
+    let preview_bytes = content.len();
+    let preview_lines = content.lines().count();
 
     Ok(WorkspaceFile {
         path: display_relative(&relative),
         content,
         size,
-        truncated,
+        truncated: byte_truncated || line_truncated,
+        preview_bytes,
+        preview_lines,
+        truncation_reason,
     })
 }
 
@@ -2089,6 +2103,40 @@ mod tests {
             .expect("large text preview should load");
         assert!(large.truncated);
         assert_eq!(large.content.len(), MAX_FILE_PREVIEW_BYTES);
+        assert_eq!(large.preview_bytes, MAX_FILE_PREVIEW_BYTES);
+        assert_eq!(large.truncation_reason.as_deref(), Some("bytes"));
+
+        fs::write(
+            workspace.join("exact-byte-limit.txt"),
+            vec![b'x'; MAX_FILE_PREVIEW_BYTES],
+        )
+        .expect("exact byte limit fixture should be written");
+        let exact_bytes = read_workspace_file_at(&canonical, "exact-byte-limit.txt".into())
+            .expect("the exact byte limit should load completely");
+        assert!(!exact_bytes.truncated);
+        assert_eq!(exact_bytes.preview_bytes, MAX_FILE_PREVIEW_BYTES);
+        assert_eq!(exact_bytes.truncation_reason, None);
+
+        let mut split_utf8 = vec![b'x'; MAX_FILE_PREVIEW_BYTES - 1];
+        split_utf8.extend_from_slice("é".as_bytes());
+        fs::write(workspace.join("split-utf8.txt"), split_utf8)
+            .expect("split UTF-8 fixture should be written");
+        let split_utf8 = read_workspace_file_at(&canonical, "split-utf8.txt".into())
+            .expect("a partial trailing UTF-8 codepoint should be removed safely");
+        assert!(split_utf8.truncated);
+        assert_eq!(split_utf8.preview_bytes, MAX_FILE_PREVIEW_BYTES - 1);
+        assert_eq!(split_utf8.truncation_reason.as_deref(), Some("bytes"));
+
+        fs::write(
+            workspace.join("expanded-preview.txt"),
+            "line\n".repeat(4_001),
+        )
+        .expect("expanded preview fixture should be written");
+        let expanded = read_workspace_file_at(&canonical, "expanded-preview.txt".into())
+            .expect("files beyond the previous line limit should load completely");
+        assert!(!expanded.truncated);
+        assert_eq!(expanded.preview_lines, 4_001);
+        assert_eq!(expanded.truncation_reason, None);
 
         fs::write(
             workspace.join("many-lines.txt"),
@@ -2099,6 +2147,35 @@ mod tests {
             .expect("line-limited preview should load");
         assert!(many_lines.truncated);
         assert_eq!(many_lines.content.lines().count(), MAX_FILE_PREVIEW_LINES);
+        assert_eq!(many_lines.preview_lines, MAX_FILE_PREVIEW_LINES);
+        assert_eq!(many_lines.truncation_reason.as_deref(), Some("lines"));
+
+        fs::write(
+            workspace.join("exact-line-limit.txt"),
+            "line\n".repeat(MAX_FILE_PREVIEW_LINES),
+        )
+        .expect("exact line limit fixture should be written");
+        let exact_lines = read_workspace_file_at(&canonical, "exact-line-limit.txt".into())
+            .expect("the exact line limit should load completely");
+        assert!(!exact_lines.truncated);
+        assert_eq!(exact_lines.preview_lines, MAX_FILE_PREVIEW_LINES);
+        assert_eq!(exact_lines.truncation_reason, None);
+
+        let combined_content = format!(
+            "{}{}",
+            "line\n".repeat(MAX_FILE_PREVIEW_LINES + 1),
+            "x".repeat(MAX_FILE_PREVIEW_BYTES)
+        );
+        fs::write(workspace.join("combined-limit.txt"), combined_content)
+            .expect("combined limit fixture should be written");
+        let combined = read_workspace_file_at(&canonical, "combined-limit.txt".into())
+            .expect("combined limits should return a bounded preview");
+        assert!(combined.truncated);
+        assert_eq!(combined.preview_lines, MAX_FILE_PREVIEW_LINES);
+        assert_eq!(
+            combined.truncation_reason.as_deref(),
+            Some("bytes-and-lines")
+        );
 
         fs::write(
             workspace.join("diff-lines.txt"),

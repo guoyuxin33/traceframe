@@ -51,6 +51,9 @@ export interface WorkspaceFile {
   content: string
   size: number
   truncated: boolean
+  previewBytes?: number
+  previewLines?: number
+  truncationReason?: 'bytes' | 'lines' | 'bytes-and-lines' | null
 }
 
 interface StoredSession {

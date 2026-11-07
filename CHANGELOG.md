@@ -55,6 +55,7 @@ This project has no tagged public release yet. The current package version is `0
 - Trace hides per-delta stream fragments, and Output keeps tool payloads collapsed until requested.
 - Formatter and generator changes made through bounded commands emit file-change events for Trace and editor following.
 - Preview servers are stopped as process groups during stop, restart, and application shutdown so child processes do not remain behind.
+- Workspace files now load up to 1 MiB or 12,000 lines for viewing and editing, and genuinely truncated previews report the loaded range and limiting reason.
 
 ### Security
 

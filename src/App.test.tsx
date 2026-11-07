@@ -26,6 +26,7 @@ import {
   currentExecutionSummary,
   dockLayoutJson,
   executionSteps,
+  filePreviewNotice,
   firstActiveSessionId,
   isRetiredOpenAiModel,
   mergeSnapshotEvents,
@@ -1281,5 +1282,84 @@ describe('untracked diff', () => {
       '+two',
     ].join('\n'))
     expect(untrackedFileDiff({ path: 'large.txt', content: 'partial', size: 100, truncated: true })).toBe('')
+  })
+})
+
+describe('large file previews', () => {
+  it('reports the loaded range and the limit that truncated the file', () => {
+    const notice = filePreviewNotice({
+      path: 'generated.log',
+      content: 'partial',
+      size: 2 * 1024 * 1024,
+      truncated: true,
+      previewBytes: 768 * 1024,
+      previewLines: 12_000,
+      truncationReason: 'lines',
+    })
+
+    expect(notice).toContain('Showing first 12,000 lines')
+    expect(notice).toContain('768 KB of 2.0 MB')
+    expect(notice).toContain('line safety limit')
+  })
+
+  it('distinguishes byte and combined limits and measures UTF-8 fallbacks accurately', () => {
+    const byteLimited = filePreviewNotice({
+      path: 'unicode.txt',
+      content: '你\n好\n',
+      size: 20,
+      truncated: true,
+      truncationReason: 'bytes',
+    })
+    expect(byteLimited).toContain('Showing first 2 lines')
+    expect(byteLimited).toContain('8 B of 20 B')
+    expect(byteLimited).toContain('size safety limit')
+
+    expect(filePreviewNotice({
+      path: 'combined.txt',
+      content: 'partial',
+      size: 3 * 1024 * 1024,
+      truncated: true,
+      previewBytes: 1024 * 1024,
+      previewLines: 12_000,
+      truncationReason: 'bytes-and-lines',
+    })).toContain('line and size safety limits')
+    expect(filePreviewNotice({ path: 'small.txt', content: 'complete', size: 8, truncated: false })).toBe('')
+  })
+
+  it('shows the current read-only preview when an unsaved draft becomes truncated', () => {
+    render(<CodeView
+      file={{
+        path: 'generated.log',
+        content: 'current disk preview\n',
+        size: 2 * 1024 * 1024,
+        truncated: true,
+        previewBytes: 21,
+        previewLines: 1,
+        truncationReason: 'bytes',
+      }}
+      loading={false}
+      error={null}
+      mode="edit"
+      draft="stale unsaved draft"
+      draftPath="generated.log"
+      dirty
+      saving={false}
+      saveError={null}
+      canEdit={false}
+      onMode={vi.fn()}
+      onDraft={vi.fn()}
+      onSave={vi.fn()}
+      onRevert={vi.fn()}
+    />)
+
+    expect(screen.getByText('current disk preview')).toBeVisible()
+    expect(screen.queryByText('stale unsaved draft')).not.toBeInTheDocument()
+    expect(screen.queryByRole('textbox', { name: '编辑 generated.log' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'View' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /Save/ })).toBeDisabled()
+    expect(screen.getByText('Read only · unsaved draft retained')).toBeVisible()
+    expect(screen.getByText('1 line')).toBeVisible()
+    expect(screen.getByText('Viewing')).toBeVisible()
   })
 })
