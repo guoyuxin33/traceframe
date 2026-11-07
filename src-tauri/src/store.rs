@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -270,6 +270,94 @@ impl AppStore {
                 memories,
                 events,
             })
+        })
+    }
+
+    pub fn reconcile_interrupted_runs(&self) -> Result<usize, String> {
+        self.with_connection(|connection| {
+            let transaction = Transaction::new_unchecked(
+                connection,
+                TransactionBehavior::Immediate,
+            )
+            .map_err(|error| format!("Run recovery transaction could not be started: {error}"))?;
+            let interrupted_runs = {
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT session_id, run_id, MAX(sequence), MAX(created_at)
+                         FROM runtime_events
+                         GROUP BY session_id, run_id
+                         HAVING MAX(CASE WHEN event_type = 'run.created' THEN 1 ELSE 0 END) = 1
+                            AND MAX(CASE WHEN event_type IN ('run.completed', 'run.failed', 'run.cancelled') THEN 1 ELSE 0 END) = 0
+                         ORDER BY MAX(created_at) ASC, run_id ASC",
+                    )
+                    .map_err(|error| format!("Interrupted runs could not be inspected: {error}"))?;
+                let records = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, u64>(2)?,
+                            row.get::<_, u64>(3)?,
+                        ))
+                    })
+                    .map_err(|error| format!("Interrupted runs could not be read: {error}"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("Interrupted runs could not be decoded: {error}"))?;
+                records
+            };
+
+            for (session_id, run_id, last_sequence, last_created_at) in &interrupted_runs {
+                let recovered_at = now_millis().max(last_created_at.saturating_add(1));
+                let payload = serde_json::json!({
+                    "reason": "app_interrupted",
+                    "error": "Traceframe closed before this run reached a terminal state.",
+                    "interrupted": true,
+                    "recoveredOnStartup": true,
+                    "recoveredAt": recovered_at,
+                    "lastSequence": last_sequence,
+                });
+                let encoded = serde_json::to_string(&payload).map_err(|error| {
+                    format!("Recovered run event could not be encoded: {error}")
+                })?;
+                transaction
+                    .execute(
+                        "INSERT INTO runtime_events (id, session_id, run_id, sequence, event_type, payload, created_at)
+                         VALUES (?1, ?2, ?3, ?4, 'run.failed', ?5, ?6)",
+                        params![
+                            new_id("event"),
+                            session_id,
+                            run_id,
+                            last_sequence.saturating_add(1),
+                            encoded,
+                            recovered_at
+                        ],
+                    )
+                    .map_err(|error| format!("Interrupted run could not be finalized: {error}"))?;
+                transaction
+                    .execute(
+                        "INSERT INTO messages (id, session_id, author, role, body, meta, created_at)
+                         VALUES (?1, ?2, 'Runtime', 'system', ?3, ?4, ?5)",
+                        params![
+                            new_id("message"),
+                            session_id,
+                            "This run was interrupted before a final result was recorded. Partial output and workspace changes may remain; review the trace and working tree before continuing.",
+                            format!("run interrupted · {run_id}"),
+                            recovered_at
+                        ],
+                    )
+                    .map_err(|error| format!("Interrupted run message could not be saved: {error}"))?;
+                transaction
+                    .execute(
+                        "UPDATE sessions SET updated_at = MAX(updated_at, ?2) WHERE id = ?1",
+                        params![session_id, recovered_at],
+                    )
+                    .map_err(|error| format!("Interrupted run session could not be updated: {error}"))?;
+            }
+
+            transaction
+                .commit()
+                .map_err(|error| format!("Run recovery could not be committed: {error}"))?;
+            Ok(interrupted_runs.len())
         })
     }
 
@@ -950,6 +1038,196 @@ mod tests {
             "The public interface remains unchanged"
         );
         drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovers_interrupted_runs_once_with_a_visible_runtime_message() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("traceframe-recovery-test-{nonce}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("traceframe.sqlite3");
+        let store = AppStore::default();
+        store.initialize(database.clone()).unwrap();
+        let session = store
+            .create_session_record("Recovery".into(), "main".into(), "/tmp/project".into())
+            .unwrap();
+        store
+            .append_event(
+                &session.id,
+                "interrupted-run",
+                0,
+                "run.created",
+                &serde_json::json!({ "provider": "test" }),
+            )
+            .unwrap();
+        for event_type in ["run.failed", "run.cancelled"] {
+            let run_id = format!("terminal-{event_type}");
+            store
+                .append_event(
+                    &session.id,
+                    &run_id,
+                    0,
+                    "run.created",
+                    &serde_json::json!({ "provider": "test" }),
+                )
+                .unwrap();
+            store
+                .append_event(&session.id, &run_id, 1, event_type, &serde_json::json!({}))
+                .unwrap();
+        }
+        store
+            .append_event(
+                &session.id,
+                "interrupted-run",
+                1,
+                "tool.completed",
+                &serde_json::json!({ "tool": "read_file" }),
+            )
+            .unwrap();
+        store
+            .append_event(
+                &session.id,
+                "completed-run",
+                0,
+                "run.created",
+                &serde_json::json!({ "provider": "test" }),
+            )
+            .unwrap();
+        store
+            .append_event(
+                &session.id,
+                "completed-run",
+                1,
+                "run.completed",
+                &serde_json::json!({ "usage": {} }),
+            )
+            .unwrap();
+        store
+            .append_event(
+                &session.id,
+                "event-without-run",
+                0,
+                "tool.failed",
+                &serde_json::json!({ "error": "fixture" }),
+            )
+            .unwrap();
+
+        assert_eq!(store.reconcile_interrupted_runs().unwrap(), 1);
+        assert_eq!(store.reconcile_interrupted_runs().unwrap(), 0);
+        let snapshot = store.snapshot().unwrap();
+        let recovered = snapshot
+            .events
+            .iter()
+            .filter(|event| event.run_id == "interrupted-run" && event.event_type == "run.failed")
+            .collect::<Vec<_>>();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].sequence, 2);
+        assert_eq!(recovered[0].payload["reason"], "app_interrupted");
+        assert_eq!(recovered[0].payload["lastSequence"], 1);
+        assert!(!snapshot
+            .events
+            .iter()
+            .any(|event| event.run_id == "completed-run" && event.event_type == "run.failed"));
+        assert!(!snapshot
+            .events
+            .iter()
+            .any(|event| event.run_id == "event-without-run" && event.event_type == "run.failed"));
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| event.payload["reason"] == "app_interrupted")
+                .count(),
+            1
+        );
+        let messages = snapshot
+            .messages
+            .iter()
+            .filter(|message| message.meta == "run interrupted · interrupted-run")
+            .collect::<Vec<_>>();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].author, "Runtime");
+        assert_eq!(messages[0].role, "system");
+        drop(store);
+
+        let reopened = AppStore::default();
+        reopened.initialize(database).unwrap();
+        assert_eq!(reopened.reconcile_interrupted_runs().unwrap(), 0);
+        let snapshot = reopened.snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| {
+                    event.run_id == "interrupted-run" && event.event_type == "run.failed"
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .messages
+                .iter()
+                .filter(|message| message.meta == "run interrupted · interrupted-run")
+                .count(),
+            1
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_run_recovery_rolls_back_event_when_message_fails() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("traceframe-recovery-rollback-{nonce}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("traceframe.sqlite3");
+        let store = AppStore::default();
+        store.initialize(database.clone()).unwrap();
+        let session = store
+            .create_session_record("Recovery".into(), "main".into(), "/tmp/project".into())
+            .unwrap();
+        store
+            .append_event(
+                &session.id,
+                "interrupted-run",
+                0,
+                "run.created",
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        store
+            .with_connection(|connection| {
+                connection
+                    .execute_batch(
+                        "CREATE TRIGGER reject_recovery_message
+                         BEFORE INSERT ON messages
+                         WHEN NEW.meta LIKE 'run interrupted%'
+                         BEGIN SELECT RAISE(ABORT, 'recovery message rejected'); END;",
+                    )
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+
+        assert!(store.reconcile_interrupted_runs().is_err());
+        let connection = Connection::open(database).unwrap();
+        let recovered_events = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_events WHERE run_id = 'interrupted-run' AND event_type = 'run.failed'",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap();
+        assert_eq!(recovered_events, 0);
+        drop(connection);
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 

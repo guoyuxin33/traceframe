@@ -979,8 +979,9 @@ pub fn run() {
                 .map_err(|error| format!("Application data directory is unavailable: {error}"))?;
             app.state::<WorkspaceAccess>()
                 .load_recent(config_dir.join("recent-workspace.json"))?;
-            app.state::<AppStore>()
-                .initialize(data_dir.join("traceframe.sqlite3"))?;
+            let store = app.state::<AppStore>();
+            store.initialize(data_dir.join("traceframe.sqlite3"))?;
+            store.reconcile_interrupted_runs()?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

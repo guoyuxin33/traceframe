@@ -617,7 +617,7 @@ export function ConversationPanel({
 
   useEffect(() => {
     streamEnd.current?.scrollIntoView({ block: 'nearest' })
-  }, [liveMessage?.body, messages.length])
+  }, [session.id, liveMessage?.body, messages.length])
 
   useEffect(() => {
     if (runActive && !wasRunActive.current) setRunInputMode('steer')

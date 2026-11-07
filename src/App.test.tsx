@@ -112,6 +112,16 @@ describe('session interaction state', () => {
 })
 
 describe('conversation controls', () => {
+  it('scrolls to the latest message when switching between equal-length sessions', async () => {
+    const scrollIntoView = vi.fn()
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: scrollIntoView })
+    const view = render(<ConversationPanel session={activeSession} messages={[]} agents={[]} disabled={false} onSend={vi.fn().mockResolvedValue(true)} />)
+    await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1))
+
+    view.rerender(<ConversationPanel session={{ ...activeSession, id: 'second' }} messages={[]} agents={[]} disabled={false} onSend={vi.fn().mockResolvedValue(true)} />)
+    await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(2))
+  })
+
   it('keeps drafts isolated per session and clears only after a successful send', async () => {
     const user = userEvent.setup()
     const onSend = vi.fn().mockResolvedValue(true)
