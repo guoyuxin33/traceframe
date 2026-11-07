@@ -25,6 +25,11 @@ This project has no tagged public release yet. The current package version is `0
 - Local project preview lifecycle controls, loopback URL loading, bounded project logs, and atomic restart-and-refresh behavior.
 - Preview element selection that creates a structured conversation draft with selector, visible text, geometry, and bounded HTML context.
 - Explicit command staging from Preview to Terminal for development and deployment commands; staged commands are never automatically executed.
+- Reversible AI file approval with per-file and whole-batch accept/reject controls, exact before/after snapshots, real rollback, stale-review protection, and durable decision audit records; `Full access` keeps the same diff trail while accepting by policy.
+- Local Skills discovery and enablement plus remote MCP endpoint, tool allowlist, health-check, and approval-policy settings with non-persistent authorization tokens.
+- Inline run-scoped MCP approvals that show server, tool, and arguments, pause the native Responses run, and resume it with an explicit allow or reject response.
+- A bounded, selectable Git commit topology view with merge lanes, navigable parent details, and correctly peeled HEAD, local, remote, lightweight-tag, and annotated-tag refs.
+- Closeable dock panels with left-rail restore to the user's last tabset, persisted restore locations, and preset-based full layout reset.
 
 ### Changed
 
@@ -41,6 +46,7 @@ This project has no tagged public release yet. The current package version is `0
 - Code, diff, output, and execution-evidence surfaces use a dedicated high-contrast code palette and adapt to narrow dock widths.
 - Code, Diff, Preview, Terminal, Output, and Trace are separate draggable tabs so project interaction and execution evidence can be positioned independently.
 - Project pages load through an ephemeral loopback proxy so scripts, styles, and module imports work without weakening the desktop host's script policy.
+- File and MCP approval controls are rendered in the conversation run segment that produced them instead of being collected after the full conversation.
 
 ### Fixed
 
