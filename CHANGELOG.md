@@ -18,6 +18,7 @@ This project has no tagged public release yet. The current package version is `0
 - Official current OpenAI text/code model catalog reference in settings.
 - Line-aware agent edit following that activates Code, opens the changed file, centers and marks the affected range, and can be paused for manual navigation.
 - Per-session follow-up prompt queues with Enter-to-send, Shift+Enter multiline input, visible ordering, removal, and automatic serial execution.
+- Pi-style host-side steering for Responses runs, with a distinct `Guide run` composer mode, durable user messages, bounded FIFO delivery at root turn boundaries, and `run.steered` trace evidence.
 - Host-enforced `scout`, `reviewer`, and `worker` child-agent profiles with read-only tool boundaries for investigation and review.
 
 ### Changed
@@ -28,6 +29,7 @@ This project has no tagged public release yet. The current package version is `0
 - Compacted messages are excluded from later runtime input while their durable summary remains available.
 - Non-Responses provider requests can be cancelled while waiting for response headers and record terminal failures consistently.
 - Responses runs use a tools-disabled synthesis request after exhausting their tool-round budget instead of failing immediately after the last successful tool call.
+- Tool rounds and total model turns are counted separately, so active-run guidance does not consume the coding tool budget.
 - File paths emitted by mutating runtime tools are normalized before renderer navigation.
 - Active tool results are bounded before re-entering model context, while command output pipes continue draining to EOF.
 - Chat and Anthropic streams require their terminal frame before a reply is persisted as complete.

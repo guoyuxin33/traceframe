@@ -71,6 +71,7 @@ import {
   readWorkspaceFile,
   saveNativeMemory,
   startNativeRun,
+  steerNativeRun,
   switchGitBranch,
   testNativeProvider,
   updateNativeMemory,
@@ -102,6 +103,8 @@ export interface QueuedPrompt {
   sessionId: string
   text: string
 }
+
+export type ComposerSendMode = 'run' | 'steer' | 'queue'
 
 export function agentEditTarget(event: RuntimeEventRecord): AgentEditTarget | null {
   if (event.type !== 'file.changed') return null
@@ -585,6 +588,7 @@ export function ConversationPanel({
   disabled,
   runActive = false,
   queuedPrompts = [],
+  notice,
   onSend,
   onRemoveQueued = () => undefined,
   onRunQueued = async () => undefined,
@@ -596,12 +600,16 @@ export function ConversationPanel({
   disabled: boolean
   runActive?: boolean
   queuedPrompts?: QueuedPrompt[]
-  onSend: (text: string) => Promise<boolean>
+  notice?: string
+  onSend: (text: string, mode: ComposerSendMode) => Promise<boolean>
   onRemoveQueued?: (id: string) => void
   onRunQueued?: (prompt: QueuedPrompt) => Promise<void>
 }) {
   const [drafts, setDrafts] = useState<Record<string, string>>({})
+  const [runInputMode, setRunInputMode] = useState<'steer' | 'queue'>('steer')
   const [submitting, setSubmitting] = useState(false)
+  const submittingRef = useRef(false)
+  const wasRunActive = useRef(runActive)
   const streamEnd = useRef<HTMLDivElement>(null)
   const draft = drafts[session.id] ?? ''
   const workingAgents = agents.filter((agent) => agent.state === 'working')
@@ -611,16 +619,24 @@ export function ConversationPanel({
     streamEnd.current?.scrollIntoView({ block: 'nearest' })
   }, [liveMessage?.body, messages.length])
 
+  useEffect(() => {
+    if (runActive && !wasRunActive.current) setRunInputMode('steer')
+    wasRunActive.current = runActive
+  }, [runActive])
+
   const submit = async (event: FormEvent) => {
     event.preventDefault()
-    if (disabled || submitting || !draft.trim()) return
+    if (disabled || submittingRef.current || !draft.trim()) return
     const submittedDraft = draft
+    submittingRef.current = true
     setSubmitting(true)
     try {
-      if (await onSend(submittedDraft.trim())) {
+      const mode: ComposerSendMode = runActive ? runInputMode : 'run'
+      if (await onSend(submittedDraft.trim(), mode)) {
         setDrafts((current) => current[session.id] === submittedDraft ? { ...current, [session.id]: '' } : current)
       }
     } finally {
+      submittingRef.current = false
       setSubmitting(false)
     }
   }
@@ -665,6 +681,29 @@ export function ConversationPanel({
       ) : null}
 
       <form className="composer" onSubmit={submit}>
+        {runActive ? (
+          <div className="composer-mode-row">
+            <div className="composer-mode" role="group" aria-label="Active run message behavior">
+              <button
+                type="button"
+                className={runInputMode === 'steer' ? 'is-active' : ''}
+                aria-pressed={runInputMode === 'steer'}
+                title="Apply this instruction after the active run's current step"
+                disabled={submitting}
+                onClick={() => setRunInputMode('steer')}
+              >Guide run</button>
+              <button
+                type="button"
+                className={runInputMode === 'queue' ? 'is-active' : ''}
+                aria-pressed={runInputMode === 'queue'}
+                title="Start a new turn after this run finishes"
+                disabled={submitting}
+                onClick={() => setRunInputMode('queue')}
+              >Queue next</button>
+            </div>
+          </div>
+        ) : null}
+        {notice ? <div className="composer-notice" role="status" aria-live="polite">{notice}</div> : null}
         <textarea
           value={draft}
           onChange={(event) => setDrafts((current) => ({ ...current, [session.id]: event.target.value }))}
@@ -675,15 +714,15 @@ export function ConversationPanel({
           }}
           disabled={disabled}
           rows={3}
-          placeholder={session.archived ? 'Restore this session to continue' : runActive ? 'Add the next turn to the queue…' : 'Message orchestrator…'}
-          aria-label="发送给主智能体"
+          placeholder={session.archived ? 'Restore this session to continue' : runActive && runInputMode === 'steer' ? 'Guide the active run…' : runActive ? 'Queue the next turn…' : 'Message orchestrator…'}
+          aria-label={runActive && runInputMode === 'steer' ? '引导当前运行' : runActive ? '排队下一轮' : '发送给主智能体'}
         />
         <div className="composer-footer">
           <div className="composer-tools">
             <span className="scope-label">scope: {session.branch}</span>
             {runActive || queuedPrompts.length ? <span className="composer-queue-state">{queuedPrompts.length} queued</span> : null}
           </div>
-          <button className="send-button" type="submit" aria-label={runActive ? '排队消息' : '发送消息'} disabled={disabled || submitting || !draft.trim()}><Send size={16} /></button>
+          <button className="send-button" type="submit" aria-label={runActive && runInputMode === 'steer' ? '引导当前运行' : runActive ? '排队消息' : '发送消息'} disabled={disabled || submitting || !draft.trim()}><Send size={16} /></button>
         </div>
       </form>
     </section>
@@ -1803,6 +1842,7 @@ export default function App() {
   const [memories, setMemories] = useState<MemoryRecord[]>(() => desktop ? [] : loadStored('traceframe.memories', initialMemories))
   const [runtimeEvents, setRuntimeEvents] = useState<RuntimeEventRecord[]>([])
   const [queuedPrompts, setQueuedPrompts] = useState<QueuedPrompt[]>([])
+  const [composerNotices, setComposerNotices] = useState<Record<string, string>>({})
   const queuedPromptsRef = useRef<QueuedPrompt[]>([])
   const [branch, setBranch] = useState('main')
   const [model, setModel] = useState(() => loadStored('traceframe.model', 'cc-switch'))
@@ -2128,8 +2168,11 @@ export default function App() {
   )), [activeSession.id, memories, workspace?.path])
   const liveMessage = useMemo(() => {
     if (runState !== 'running' || !activeRunId) return undefined
+    const latestSteeringBoundary = activeEvents
+      .filter((event) => event.runId === activeRunId && event.type === 'run.steered' && (!event.payload.agentId || event.payload.agentId === 'root'))
+      .reduce((latest, event) => Math.max(latest, event.sequence), -1)
     const deltas = activeEvents
-      .filter((event) => event.runId === activeRunId && event.type === 'model.delta' && (!event.payload.agentId || event.payload.agentId === 'root'))
+      .filter((event) => event.runId === activeRunId && event.type === 'model.delta' && event.sequence > latestSteeringBoundary && (!event.payload.agentId || event.payload.agentId === 'root'))
       .sort((left, right) => left.sequence - right.sequence)
     const body = deltas.map((event) => firstString(event.payload.text) ?? '').join('')
     if (!body) return undefined
@@ -2323,7 +2366,7 @@ export default function App() {
     setActiveSessionId(id)
   }
 
-  const sendMessage = async (text: string): Promise<boolean> => {
+  const sendMessage = async (text: string, mode: ComposerSendMode = 'run'): Promise<boolean> => {
     const sessionId = activeSession.id
     if (desktop) {
       if (activeSession.archived) {
@@ -2331,7 +2374,31 @@ export default function App() {
         return false
       }
       if (activeRunRef.current) {
+        if (mode === 'steer') {
+          const runId = activeRunRef.current
+          try {
+            const message = await steerNativeRun(runId, text)
+            if (message) {
+              setSessionMessages((current) => ({
+                ...current,
+                [message.sessionId ?? sessionId]: [...(current[message.sessionId ?? sessionId] ?? []), message],
+              }))
+              setComposerNotices((current) => ({ ...current, [sessionId]: 'Guidance queued for the active run' }))
+              return true
+            }
+          } catch (error) {
+            setAppError(errorMessage(error))
+            return false
+          }
+          updateQueuedPrompts((current) => [...current, { id: crypto.randomUUID(), sessionId, text }])
+          setComposerNotices((current) => ({
+            ...current,
+            [sessionId]: 'The active run could not accept guidance. Added to the queue as the next turn.',
+          }))
+          return true
+        }
         updateQueuedPrompts((current) => [...current, { id: crypto.randomUUID(), sessionId, text }])
+        setComposerNotices((current) => ({ ...current, [sessionId]: 'Added to the queue for the next turn' }))
         return true
       }
       if (!workspace) {
@@ -2357,6 +2424,7 @@ export default function App() {
         return false
       }
       setAppError(null)
+      setComposerNotices((current) => ({ ...current, [sessionId]: '' }))
       const runId = crypto.randomUUID()
       cancelAgentNavigation(false)
       setFollowAgent(true)
@@ -2390,6 +2458,9 @@ export default function App() {
         try {
           await startNativeRun({ runId, sessionId, workspacePath: workspace.path, branch, prompt: text, provider }, (event) => {
             setRuntimeEvents((current) => [event, ...current.filter((item) => item.id !== event.id)].slice(0, 500))
+            if (event.type === 'run.steered' && (!event.payload.agentId || event.payload.agentId === 'root')) {
+              setComposerNotices((current) => ({ ...current, [sessionId]: 'Guidance applied at the next turn boundary' }))
+            }
             if (event.type === 'file.changed') {
               const target = agentEditTarget(event)
               if (!target) return
@@ -2413,6 +2484,7 @@ export default function App() {
           setAppError(detail)
         } finally {
           await reloadNativeState().catch((error) => setAppError(errorMessage(error)))
+          setComposerNotices((current) => ({ ...current, [sessionId]: '' }))
           const latestTarget = latestAgentEditRef.current
           const finalFile = followAgentEditsRef.current && !editorDirtyRef.current && latestTarget ? latestTarget.path : selectedFileRef.current
           await loadWorkspace(workspace.path, finalFile).catch(() => undefined)
@@ -2630,6 +2702,7 @@ export default function App() {
         disabled={Boolean(activeSession.archived)}
         runActive={runState === 'running'}
         queuedPrompts={queuedPrompts.filter((prompt) => prompt.sessionId === activeSession.id)}
+        notice={composerNotices[activeSession.id]}
         onSend={sendMessage}
         onRemoveQueued={removeQueuedPrompt}
         onRunQueued={runQueuedPrompt}

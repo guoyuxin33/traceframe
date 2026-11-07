@@ -8,7 +8,7 @@ use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -25,7 +25,10 @@ const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_MODEL_TOOL_OUTPUT_CHARS: usize = 16_000;
 const MAX_TOOL_ROUNDS: usize = 16;
 const MAX_CHILD_TOOL_ROUNDS: usize = 8;
+const MAX_MODEL_TURNS: usize = 32;
 const MAX_DELEGATED_AGENTS: usize = 4;
+const MAX_STEERING_MESSAGES: usize = 16;
+const MAX_STEERING_MESSAGE_CHARS: usize = 2_000;
 const MAX_COMMAND_ARGS: usize = 64;
 const MAX_SUMMARY_CHARS: usize = 4_000;
 const MAX_MESSAGE_CHARS: usize = 2_000;
@@ -38,46 +41,184 @@ const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Default)]
 pub struct RuntimeControl {
-    cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    runs: Mutex<HashMap<String, Arc<ActiveRun>>>,
+}
+
+#[derive(Debug)]
+struct ActiveRun {
+    cancellation: AtomicBool,
+    steering: Mutex<SteeringInbox>,
+    session_id: String,
+}
+
+#[derive(Debug)]
+struct SteeringInbox {
+    messages: VecDeque<String>,
+    accepting: bool,
+    finishing: bool,
+}
+
+impl ActiveRun {
+    fn new(session_id: &str, accepts_steering: bool) -> Self {
+        Self {
+            cancellation: AtomicBool::new(false),
+            steering: Mutex::new(SteeringInbox {
+                messages: VecDeque::new(),
+                accepting: accepts_steering,
+                finishing: false,
+            }),
+            session_id: session_id.to_owned(),
+        }
+    }
+
+    fn take_steering(&self, close_if_empty: bool) -> Result<Vec<String>, String> {
+        let mut inbox = self
+            .steering
+            .lock()
+            .map_err(|_| "Runtime steering state is unavailable".to_string())?;
+        if self.cancellation.load(Ordering::SeqCst) {
+            inbox.accepting = false;
+            inbox.messages.clear();
+            return Ok(Vec::new());
+        }
+        let messages = inbox.messages.drain(..).collect::<Vec<_>>();
+        if messages.is_empty() && close_if_empty {
+            inbox.accepting = false;
+            inbox.finishing = true;
+        }
+        Ok(messages)
+    }
+
+    fn cancel(&self) -> Result<bool, String> {
+        let mut inbox = self
+            .steering
+            .lock()
+            .map_err(|_| "Runtime state is unavailable".to_string())?;
+        if inbox.finishing {
+            return Ok(false);
+        }
+        self.cancellation.store(true, Ordering::SeqCst);
+        inbox.accepting = false;
+        inbox.messages.clear();
+        Ok(true)
+    }
+
+    fn close(&self) {
+        if let Ok(mut inbox) = self.steering.lock() {
+            inbox.accepting = false;
+            inbox.finishing = true;
+            inbox.messages.clear();
+        }
+    }
+
+    fn stop_accepting_steering(&self) -> Result<Vec<String>, String> {
+        let mut inbox = self
+            .steering
+            .lock()
+            .map_err(|_| "Runtime steering state is unavailable".to_string())?;
+        inbox.accepting = false;
+        Ok(inbox.messages.drain(..).collect())
+    }
 }
 
 impl RuntimeControl {
-    fn register(&self, run_id: &str) -> Result<Arc<AtomicBool>, String> {
+    fn register(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        accepts_steering: bool,
+    ) -> Result<Arc<ActiveRun>, String> {
         let mut runs = self
-            .cancellations
+            .runs
             .lock()
-            .map_err(|_| "Runtime cancellation state is unavailable".to_string())?;
+            .map_err(|_| "Runtime state is unavailable".to_string())?;
         match runs.entry(run_id.to_owned()) {
             Entry::Occupied(_) => Err("A run with this ID is already active".into()),
             Entry::Vacant(entry) => {
-                let cancellation = Arc::new(AtomicBool::new(false));
-                entry.insert(cancellation.clone());
-                Ok(cancellation)
+                let active = Arc::new(ActiveRun::new(session_id, accepts_steering));
+                entry.insert(active.clone());
+                Ok(active)
             }
         }
     }
 
-    fn unregister(&self, run_id: &str, cancellation: &Arc<AtomicBool>) {
-        if let Ok(mut runs) = self.cancellations.lock() {
+    fn unregister(&self, run_id: &str, active: &Arc<ActiveRun>) {
+        active.close();
+        if let Ok(mut runs) = self.runs.lock() {
             let owns_registration = runs
                 .get(run_id)
-                .is_some_and(|current| Arc::ptr_eq(current, cancellation));
+                .is_some_and(|current| Arc::ptr_eq(current, active));
             if owns_registration {
                 runs.remove(run_id);
             }
         }
+    }
+
+    fn active(&self, run_id: &str) -> Result<Option<Arc<ActiveRun>>, String> {
+        self.runs
+            .lock()
+            .map(|runs| runs.get(run_id).cloned())
+            .map_err(|_| "Runtime state is unavailable".to_string())
+    }
+
+    fn steer(
+        &self,
+        store: &AppStore,
+        run_id: &str,
+        message: &str,
+    ) -> Result<Option<MessageRecord>, String> {
+        let body = message.trim();
+        if body.is_empty() {
+            return Err("Steering message cannot be empty".into());
+        }
+        if body.chars().count() > MAX_STEERING_MESSAGE_CHARS {
+            return Err(format!(
+                "Steering messages are limited to {MAX_STEERING_MESSAGE_CHARS} characters"
+            ));
+        }
+        let Some(active) = self.active(run_id)? else {
+            return Ok(None);
+        };
+        let mut inbox = active
+            .steering
+            .lock()
+            .map_err(|_| "Runtime steering state is unavailable".to_string())?;
+        if active.cancellation.load(Ordering::SeqCst) || !inbox.accepting {
+            return Ok(None);
+        }
+        if inbox.messages.len() >= MAX_STEERING_MESSAGES {
+            return Err(format!(
+                "The active run already has {MAX_STEERING_MESSAGES} pending guidance messages"
+            ));
+        }
+        let record = store.append_message_record(NewMessage {
+            session_id: active.session_id.clone(),
+            author: "You".into(),
+            role: "user".into(),
+            body: body.to_owned(),
+            meta: "steering active run".into(),
+        })?;
+        inbox.messages.push_back(body.to_owned());
+        Ok(Some(record))
+    }
+
+    fn cancel(&self, run_id: &str) -> Result<bool, String> {
+        let Some(active) = self.active(run_id)? else {
+            return Ok(false);
+        };
+        active.cancel()
     }
 }
 
 struct RunRegistration<'a> {
     control: &'a RuntimeControl,
     run_id: String,
-    cancellation: Arc<AtomicBool>,
+    active: Arc<ActiveRun>,
 }
 
 impl Drop for RunRegistration<'_> {
     fn drop(&mut self) {
-        self.control.unregister(&self.run_id, &self.cancellation);
+        self.control.unregister(&self.run_id, &self.active);
     }
 }
 
@@ -700,6 +841,14 @@ fn responses_input(messages: &[MessageRecord], prompt: &str) -> Vec<Value> {
         .collect::<Vec<_>>();
     input.push(json!({ "role": "user", "content": prompt.trim() }));
     input
+}
+
+fn append_steering_input(input: &mut Vec<Value>, messages: &[String]) {
+    input.extend(
+        messages
+            .iter()
+            .map(|message| json!({ "role": "user", "content": message })),
+    );
 }
 
 #[cfg(unix)]
@@ -1707,19 +1856,24 @@ async fn run_responses_agent(
     on_event: &Channel<StreamEvent>,
     store: &AppStore,
     access: &WorkspaceAccess,
-    cancellation: &AtomicBool,
+    active: &ActiveRun,
     sequence: &mut u64,
     agent: &AgentContext,
     budget: &mut AgentBudget,
 ) -> Result<Option<AgentOutcome>, String> {
+    let cancellation = &active.cancellation;
     let mut usage_rounds = Vec::new();
-    let max_rounds = if agent.allow_delegate {
+    let max_tool_rounds = if agent.allow_delegate {
         MAX_TOOL_ROUNDS
     } else {
         MAX_CHILD_TOOL_ROUNDS
     };
-    for round_index in 0..=max_rounds {
-        let allow_tools = round_index < max_rounds;
+    let mut model_turns = 0;
+    let mut tool_rounds = 0;
+    while model_turns < MAX_MODEL_TURNS {
+        let final_model_turn = model_turns + 1 == MAX_MODEL_TURNS;
+        let allow_tools = tool_rounds < max_tool_rounds && !final_model_turn;
+        model_turns += 1;
         if cancellation.load(Ordering::SeqCst) {
             emit_agent(
                 on_event,
@@ -1732,6 +1886,25 @@ async fn run_responses_agent(
             )?;
             return Ok(None);
         }
+        if final_model_turn && agent.allow_delegate {
+            let steering = active.stop_accepting_steering()?;
+            if !steering.is_empty() {
+                append_steering_input(&mut input, &steering);
+                emit_agent(
+                    on_event,
+                    store,
+                    request,
+                    sequence,
+                    "run.steered",
+                    json!({
+                        "count": steering.len(),
+                        "messages": steering,
+                        "after": "turn-boundary",
+                    }),
+                    agent,
+                )?;
+            }
+        }
         emit_agent(
             on_event,
             store,
@@ -1741,7 +1914,8 @@ async fn run_responses_agent(
             json!({
                 "endpoint": request.provider.endpoint,
                 "model": request.provider.model,
-                "round": round_index + 1,
+                "round": model_turns,
+                "toolRound": tool_rounds,
                 "toolsEnabled": allow_tools,
             }),
             agent,
@@ -1805,9 +1979,32 @@ async fn run_responses_agent(
             if round.text.trim().is_empty() {
                 return Err("Responses agent completed without text or tool calls".into());
             }
+            let steering = if agent.allow_delegate {
+                active.take_steering(true)?
+            } else {
+                Vec::new()
+            };
+            if !steering.is_empty() {
+                input.extend(round.output_items);
+                append_steering_input(&mut input, &steering);
+                emit_agent(
+                    on_event,
+                    store,
+                    request,
+                    sequence,
+                    "run.steered",
+                    json!({
+                        "count": steering.len(),
+                        "messages": steering,
+                        "after": "assistant",
+                    }),
+                    agent,
+                )?;
+                continue;
+            }
             return Ok(Some(AgentOutcome {
                 text: round.text,
-                rounds: round_index + 1,
+                rounds: model_turns,
                 usage: usage_rounds,
             }));
         }
@@ -1816,6 +2013,7 @@ async fn run_responses_agent(
                 "Responses provider requested tools after the tool budget was exhausted".into(),
             );
         }
+        tool_rounds += 1;
 
         input.extend(round.output_items);
         for call in round.tool_calls {
@@ -1956,7 +2154,7 @@ async fn run_responses_agent(
                             on_event,
                             store,
                             access,
-                            cancellation,
+                            active,
                             sequence,
                             &child,
                             budget,
@@ -2137,9 +2335,30 @@ async fn run_responses_agent(
                 "output": model_tool_output(&execution.output),
             }));
         }
+        let steering = if agent.allow_delegate {
+            active.take_steering(false)?
+        } else {
+            Vec::new()
+        };
+        if !steering.is_empty() {
+            append_steering_input(&mut input, &steering);
+            emit_agent(
+                on_event,
+                store,
+                request,
+                sequence,
+                "run.steered",
+                json!({
+                    "count": steering.len(),
+                    "messages": steering,
+                    "after": "tools",
+                }),
+                agent,
+            )?;
+        }
     }
     Err(format!(
-        "Responses agent did not return a final answer after {max_rounds} tool rounds"
+        "Responses agent did not return a final answer after {MAX_MODEL_TURNS} model turns"
     ))
 }
 
@@ -2163,11 +2382,15 @@ pub async fn runtime_start(
             request.branch, actual_branch
         ));
     }
-    let cancellation = control.register(&request.run_id)?;
+    let supports_steering = matches!(
+        request.provider.adapter.as_str(),
+        "cc-switch-responses" | "openai-responses"
+    );
+    let active = control.register(&request.run_id, &request.session_id, supports_steering)?;
     let _registration = RunRegistration {
         control: &control,
         run_id: request.run_id.clone(),
-        cancellation: cancellation.clone(),
+        active: active.clone(),
     };
 
     let mut sequence = 0;
@@ -2188,10 +2411,7 @@ pub async fn runtime_start(
     let (summary, context) = store.context_messages(&request.session_id)?;
     let memories = store.context_memories(&request.session_id, &request.workspace_path)?;
 
-    if matches!(
-        request.provider.adapter.as_str(),
-        "cc-switch-responses" | "openai-responses"
-    ) {
+    if supports_steering {
         let instructions = agent_instructions(&request, &summary, &memories);
         let input = responses_input(&context, &request.prompt);
         let root_agent = AgentContext {
@@ -2212,7 +2432,7 @@ pub async fn runtime_start(
             &on_event,
             &store,
             &access,
-            &cancellation,
+            &active,
             &mut sequence,
             &root_agent,
             &mut budget,
@@ -2244,6 +2464,7 @@ pub async fn runtime_start(
             }
             Ok(None) => Ok(()),
             Err(error) => {
+                active.close();
                 let _ = emit(
                     &on_event,
                     &store,
@@ -2297,7 +2518,7 @@ pub async fn runtime_start(
         messages.push(json!({ "role": "user", "content": request.prompt.trim() }));
         await_cancellable_response(
             send_anthropic_request(&request.provider, &system, &messages),
-            &cancellation,
+            &active.cancellation,
         )
         .await
     } else if request.provider.adapter == "openai-chat" {
@@ -2323,7 +2544,7 @@ pub async fn runtime_start(
                     .await
                     .map_err(|error| format!("Model request failed: {error}"))
             },
-            &cancellation,
+            &active.cancellation,
         )
         .await
     } else {
@@ -2372,7 +2593,7 @@ pub async fn runtime_start(
     let mut done = false;
 
     loop {
-        if cancellation.load(Ordering::SeqCst) {
+        if active.cancellation.load(Ordering::SeqCst) {
             emit(
                 &on_event,
                 &store,
@@ -2479,6 +2700,7 @@ pub async fn runtime_start(
         return Err(error);
     }
 
+    active.close();
     if let Err(error) = store.append_message_record(NewMessage {
         session_id: request.session_id.clone(),
         author: request.provider.name.clone(),
@@ -2502,16 +2724,17 @@ pub async fn runtime_start(
 
 #[tauri::command]
 pub fn runtime_cancel(run_id: String, control: State<'_, RuntimeControl>) -> Result<bool, String> {
-    let runs = control
-        .cancellations
-        .lock()
-        .map_err(|_| "Runtime cancellation state is unavailable".to_string())?;
-    if let Some(cancellation) = runs.get(&run_id) {
-        cancellation.store(true, Ordering::SeqCst);
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    control.cancel(&run_id)
+}
+
+#[tauri::command]
+pub fn runtime_steer(
+    run_id: String,
+    message: String,
+    control: State<'_, RuntimeControl>,
+    store: State<'_, AppStore>,
+) -> Result<Option<MessageRecord>, String> {
+    control.steer(&store, &run_id, &message)
 }
 
 #[cfg(test)]
@@ -2522,9 +2745,10 @@ mod tests {
         execute_tool, merge_usage, model_tool_output, parse_sse_data,
         provider_healthcheck_with_timeout, read_bounded_output, response_failure,
         response_output_text, responses_input, run_responses_agent, send_anthropic_request,
-        send_responses_request, take_sse_block, terminate_child, tool_definitions, AgentBudget,
-        AgentContext, AgentProfile, MemoryRecord, MessageRecord, ProviderConfig, RuntimeControl,
-        RuntimeRequest, ANTHROPIC_MAX_TOKENS, MAX_ERROR_BYTES, MAX_MODEL_TOOL_OUTPUT_CHARS,
+        send_responses_request, take_sse_block, terminate_child, tool_definitions, ActiveRun,
+        AgentBudget, AgentContext, AgentProfile, MemoryRecord, MessageRecord, ProviderConfig,
+        RuntimeControl, RuntimeRequest, ANTHROPIC_MAX_TOKENS, MAX_ERROR_BYTES,
+        MAX_MODEL_TOOL_OUTPUT_CHARS, MAX_STEERING_MESSAGES, MAX_STEERING_MESSAGE_CHARS,
         MAX_TOOL_ROUNDS,
     };
     use crate::{store::AppStore, WorkspaceAccess};
@@ -2613,15 +2837,116 @@ mod tests {
     #[test]
     fn runtime_control_rejects_duplicate_active_run_ids() {
         let control = RuntimeControl::default();
-        let first = control.register("run-1").unwrap();
+        let first = control.register("run-1", "session-1", true).unwrap();
         assert!(control
-            .register("run-1")
+            .register("run-1", "session-1", true)
             .unwrap_err()
             .contains("already active"));
-        control.unregister("run-1", &Arc::new(AtomicBool::new(false)));
-        assert!(control.register("run-1").is_err());
+        control.unregister("run-1", &Arc::new(ActiveRun::new("session-1", true)));
+        assert!(control.register("run-1", "session-1", true).is_err());
         control.unregister("run-1", &first);
-        assert!(control.register("run-1").is_ok());
+        assert!(control.register("run-1", "session-1", true).is_ok());
+    }
+
+    #[test]
+    fn steering_is_persisted_bounded_and_drained_fifo() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("traceframe-steering-test-{nonce}"));
+        let store = AppStore::default();
+        store.initialize(root.join("traceframe.sqlite3")).unwrap();
+        let session = store
+            .create_session_record(
+                "Steering test".into(),
+                "main".into(),
+                root.to_string_lossy().into(),
+            )
+            .unwrap();
+        let control = RuntimeControl::default();
+
+        assert!(control.steer(&store, "missing", "late").unwrap().is_none());
+        let active = control.register("run-1", &session.id, true).unwrap();
+        let first = control
+            .steer(&store, "run-1", "  first  ")
+            .unwrap()
+            .unwrap();
+        let second = control.steer(&store, "run-1", "second").unwrap().unwrap();
+        assert_eq!(first.body, "first");
+        assert_eq!(first.meta, "steering active run");
+        assert_eq!(second.session_id, session.id);
+        assert_eq!(
+            active.take_steering(false).unwrap(),
+            vec!["first", "second"]
+        );
+
+        let persisted = store.context_messages(&session.id).unwrap().1;
+        assert_eq!(persisted.len(), 2);
+        assert_eq!(persisted[0].body, "first");
+        assert_eq!(persisted[1].body, "second");
+        assert!(control
+            .steer(&store, "run-1", &"x".repeat(MAX_STEERING_MESSAGE_CHARS + 1))
+            .err()
+            .unwrap()
+            .contains("limited"));
+
+        for index in 0..MAX_STEERING_MESSAGES {
+            control
+                .steer(&store, "run-1", &format!("message-{index}"))
+                .unwrap()
+                .unwrap();
+        }
+        assert!(control
+            .steer(&store, "run-1", "overflow")
+            .err()
+            .unwrap()
+            .contains("pending guidance"));
+
+        control.unregister("run-1", &active);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn completion_and_cancellation_close_steering_atomically() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("traceframe-steering-close-{nonce}"));
+        let store = AppStore::default();
+        store.initialize(root.join("traceframe.sqlite3")).unwrap();
+        let session = store
+            .create_session_record(
+                "Steering close".into(),
+                "main".into(),
+                root.to_string_lossy().into(),
+            )
+            .unwrap();
+        let control = RuntimeControl::default();
+
+        let completing = control.register("complete", &session.id, true).unwrap();
+        assert!(completing.take_steering(true).unwrap().is_empty());
+        assert!(control
+            .steer(&store, "complete", "too late")
+            .unwrap()
+            .is_none());
+        assert!(!control.cancel("complete").unwrap());
+
+        let cancelled = control.register("cancel", &session.id, true).unwrap();
+        control.steer(&store, "cancel", "pending").unwrap().unwrap();
+        assert!(control.cancel("cancel").unwrap());
+        assert!(cancelled.take_steering(false).unwrap().is_empty());
+        assert!(control
+            .steer(&store, "cancel", "too late")
+            .unwrap()
+            .is_none());
+
+        control.unregister("complete", &completing);
+        control.unregister("cancel", &cancelled);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3157,7 +3482,7 @@ mod tests {
                 .push(body.deserialize::<serde_json::Value>().unwrap());
             Ok(())
         });
-        let cancellation = AtomicBool::new(false);
+        let active = ActiveRun::new("session-1", true);
         let mut sequence = 0;
         let root_agent = AgentContext {
             id: "root".into(),
@@ -3177,7 +3502,7 @@ mod tests {
             &channel,
             &store,
             &access,
-            &cancellation,
+            &active,
             &mut sequence,
             &root_agent,
             &mut budget,
@@ -3233,6 +3558,108 @@ mod tests {
             }),
             "expected a child tool completion event, received {delivered:#?}"
         );
+
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn responses_agent_injects_steering_after_a_tool_batch() {
+        let tool_round = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"call_id\":\"list-1\",\"name\":\"list_files\",\"arguments\":\"{\\\"query\\\":null}\"}],\"usage\":{\"input_tokens\":4}}}\n\n"
+        );
+        let final_round = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Guidance applied.\"}]}],\"usage\":{\"output_tokens\":3}}}\n\n"
+        );
+        let (endpoint, received) = serve_http_sequence(vec![
+            (200, "text/event-stream", tool_round.into()),
+            (200, "text/event-stream", final_round.into()),
+        ]);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("traceframe-steer-agent-{nonce}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = root.canonicalize().unwrap();
+        let store = AppStore::default();
+        store.initialize(root.join("traceframe.sqlite3")).unwrap();
+        let session = store
+            .create_session_record(
+                "Steering agent".into(),
+                "main".into(),
+                workspace.to_string_lossy().into(),
+            )
+            .unwrap();
+        let access = WorkspaceAccess::default();
+        access.register(workspace.clone()).unwrap();
+        let request = RuntimeRequest {
+            run_id: "run-steering-agent".into(),
+            session_id: session.id.clone(),
+            workspace_path: workspace.to_string_lossy().into(),
+            branch: "main".into(),
+            prompt: "Inspect the workspace".into(),
+            provider: ProviderConfig {
+                adapter: "openai-responses".into(),
+                ..provider(endpoint)
+            },
+        };
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let delivered_for_channel = delivered.clone();
+        let channel = tauri::ipc::Channel::new(move |body| {
+            delivered_for_channel
+                .lock()
+                .unwrap()
+                .push(body.deserialize::<serde_json::Value>().unwrap());
+            Ok(())
+        });
+        let active = ActiveRun::new(&session.id, true);
+        active
+            .steering
+            .lock()
+            .unwrap()
+            .messages
+            .push_back("Focus on source files".into());
+        let mut sequence = 0;
+        let agent = AgentContext {
+            id: "root".into(),
+            parent_id: None,
+            name: "Root".into(),
+            role: "Orchestrator".into(),
+            task: request.prompt.clone(),
+            allow_delegate: true,
+            profile: AgentProfile::Root,
+        };
+        let outcome = tauri::async_runtime::block_on(run_responses_agent(
+            &request,
+            &workspace,
+            "Use tools",
+            vec![json!({ "role": "user", "content": request.prompt })],
+            &channel,
+            &store,
+            &access,
+            &active,
+            &mut sequence,
+            &agent,
+            &mut AgentBudget::default(),
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(outcome.text, "Guidance applied.");
+
+        let requests = received.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(requests.len(), 2);
+        let second: serde_json::Value =
+            serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+        let input = second["input"].as_array().unwrap();
+        assert_eq!(input[input.len() - 2]["type"], "function_call_output");
+        assert_eq!(input.last().unwrap()["role"], "user");
+        assert_eq!(input.last().unwrap()["content"], "Focus on source files");
+        assert!(delivered
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event["type"] == "run.steered"));
 
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
@@ -3303,7 +3730,7 @@ mod tests {
             },
         };
         let channel = tauri::ipc::Channel::new(|_| Ok(()));
-        let cancellation = AtomicBool::new(false);
+        let active = ActiveRun::new("session-1", true);
         let mut sequence = 0;
         let root_agent = AgentContext {
             id: "root".into(),
@@ -3324,7 +3751,7 @@ mod tests {
             &channel,
             &store,
             &access,
-            &cancellation,
+            &active,
             &mut sequence,
             &root_agent,
             &mut budget,
@@ -3416,7 +3843,7 @@ mod tests {
             },
         };
         let channel = tauri::ipc::Channel::new(|_| Ok(()));
-        let cancellation = AtomicBool::new(false);
+        let active = ActiveRun::new("session-1", true);
         let mut sequence = 0;
         let root_agent = AgentContext {
             id: "root".into(),
@@ -3437,7 +3864,7 @@ mod tests {
             &channel,
             &store,
             &access,
-            &cancellation,
+            &active,
             &mut sequence,
             &root_agent,
             &mut budget,

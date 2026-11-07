@@ -73,6 +73,7 @@ export type RuntimeEventType =
   | 'run.completed'
   | 'run.failed'
   | 'run.cancelled'
+  | 'run.steered'
   | 'agent.started'
   | 'agent.completed'
   | 'model.requested'

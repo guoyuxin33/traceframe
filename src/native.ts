@@ -253,3 +253,8 @@ export async function startNativeRun(
 export async function cancelNativeRun(runId: string) {
   return invoke<boolean>('runtime_cancel', { runId })
 }
+
+export async function steerNativeRun(runId: string, message: string) {
+  const stored = await invoke<StoredMessage | null>('runtime_steer', { runId, message })
+  return stored ? { ...stored, time: displayTime(stored.createdAt) } satisfies Message : null
+}

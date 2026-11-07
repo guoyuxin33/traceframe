@@ -14,7 +14,7 @@ use tauri_plugin_dialog::DialogExt;
 mod runtime;
 mod store;
 
-use runtime::{provider_healthcheck, runtime_cancel, runtime_start, RuntimeControl};
+use runtime::{provider_healthcheck, runtime_cancel, runtime_start, runtime_steer, RuntimeControl};
 use store::{
     app_snapshot, append_message, archive_session, compact_session, create_session, delete_memory,
     save_memory, update_memory, update_session_scope, AppStore,
@@ -1005,7 +1005,8 @@ pub fn run() {
             compact_session,
             provider_healthcheck,
             runtime_start,
-            runtime_cancel
+            runtime_cancel,
+            runtime_steer
         ])
         .run(tauri::generate_context!())
         .expect("error while running Traceframe");

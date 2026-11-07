@@ -127,7 +127,7 @@ describe('conversation controls', () => {
     view.rerender(<ConversationPanel session={activeSession} messages={[]} agents={[]} disabled={false} onSend={onSend} />)
     expect(screen.getByRole('textbox', { name: '发送给主智能体' })).toHaveValue('first draft')
     await user.click(screen.getByRole('button', { name: '发送消息' }))
-    await waitFor(() => expect(onSend).toHaveBeenCalledWith('first draft'))
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith('first draft', 'run'))
     expect(screen.getByRole('textbox', { name: '发送给主智能体' })).toHaveValue('')
   })
 
@@ -154,11 +154,11 @@ describe('conversation controls', () => {
     expect(composer).toHaveValue('first line\nsecond line')
     expect(onSend).not.toHaveBeenCalled()
     await user.type(composer, '{enter}')
-    await waitFor(() => expect(onSend).toHaveBeenCalledWith('first line\nsecond line'))
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith('first line\nsecond line', 'run'))
     expect(composer).toHaveValue('')
   })
 
-  it('accepts the next turn during a run and exposes queued messages for removal', async () => {
+  it('guides an active run by default and can explicitly queue the next turn', async () => {
     const user = userEvent.setup()
     const onSend = vi.fn().mockResolvedValue(true)
     const onRemoveQueued = vi.fn()
@@ -176,14 +176,36 @@ describe('conversation controls', () => {
       onRemoveQueued={onRemoveQueued}
     />)
 
-    const composer = screen.getByRole('textbox', { name: '发送给主智能体' })
+    const composer = screen.getByRole('textbox', { name: '引导当前运行' })
     expect(composer).toBeEnabled()
-    expect(composer).toHaveAttribute('placeholder', 'Add the next turn to the queue…')
+    expect(screen.getByRole('button', { name: 'Guide run' })).toHaveAttribute('aria-pressed', 'true')
+    expect(composer).toHaveAttribute('placeholder', 'Guide the active run…')
     expect(screen.getByText('2 queued')).toBeVisible()
     await user.click(screen.getByRole('button', { name: '移除排队消息 1' }))
     expect(onRemoveQueued).toHaveBeenCalledWith('queued-1')
     await user.type(composer, 'Inspect the changed files{enter}')
-    await waitFor(() => expect(onSend).toHaveBeenCalledWith('Inspect the changed files'))
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith('Inspect the changed files', 'steer'))
+
+    await user.click(screen.getByRole('button', { name: 'Queue next' }))
+    expect(screen.getByRole('button', { name: 'Queue next' })).toHaveAttribute('aria-pressed', 'true')
+    expect(composer).toHaveAttribute('placeholder', 'Queue the next turn…')
+    expect(composer).toHaveAccessibleName('排队下一轮')
+    await user.type(composer, 'Run the integration tests{enter}')
+    await waitFor(() => expect(onSend).toHaveBeenLastCalledWith('Run the integration tests', 'queue'))
+  })
+
+  it('announces steering fallback without turning it into an error', () => {
+    render(<ConversationPanel
+      session={activeSession}
+      messages={[]}
+      agents={[]}
+      disabled={false}
+      runActive
+      notice="The active run could not accept guidance. Added to the queue as the next turn."
+      onSend={vi.fn().mockResolvedValue(true)}
+    />)
+
+    expect(screen.getByRole('status')).toHaveTextContent('Added to the queue as the next turn')
   })
 
   it('lets a stopped queue resume explicitly without duplicating the prompt', async () => {

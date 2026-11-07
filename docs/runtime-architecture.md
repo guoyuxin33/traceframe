@@ -24,11 +24,12 @@ Traceframe follows the useful boundaries in Pi's agent design without importing 
 
 - the Rust host owns a provider-neutral run loop, cancellation, workspace authority, tool execution, and durable event order;
 - provider adapters translate wire formats, while the canonical transcript keeps complete model output items and normalized tool results;
+- steering instructions are a bounded host-side inbox consumed by the root loop at assistant or tool turn boundaries;
 - follow-up prompts are a distinct next-run queue rather than being mixed into the active request;
 - child capabilities are host-owned profiles, so a model can choose a suitable specialist but cannot grant it broader tools;
 - every tool result is transformed to a bounded model-facing representation before the next provider request, while the trace keeps a separately bounded audit representation.
 
-Pi-style steering, where a new user instruction is injected after the current assistant/tool turn, is not implemented yet. Traceframe currently exposes only the separate visible follow-up queue. Keeping those semantics distinct avoids silently changing an in-flight coding decision.
+Pi-style steering and follow-up are separate controls. `Guide run` persists a user instruction and adds it to the active Responses run's FIFO inbox; the root loop injects it after the current assistant or tool batch without interrupting a command or file write. `Queue next` creates a renderer-managed follow-up that starts a new run after the current one completes. If the host has already claimed completion or the selected adapter is conversation-only, guidance is rejected explicitly and the renderer keeps it as the next queued turn.
 
 ## Responses agent
 
@@ -38,7 +39,7 @@ The `cc-switch-responses` and `openai-responses` adapters use the same Tracefram
 2. Send `POST /v1/responses` with `stream: true`, `store: false`, strict function tools, and the selected model.
 3. Persist each normalized event before delivering it to the renderer.
 4. Replay the complete response output, including reasoning items, and append `function_call_output` items for tool results.
-5. Continue for at most 16 tool-enabled rounds. If the model uses the final tool round, send one additional request with tools disabled so it can summarize completed work and identify anything incomplete instead of discarding the last tool results.
+5. Continue for at most 16 tool-enabled rounds and 32 total model turns. Steering-only turns do not consume the tool budget. If the model uses the final tool round, send another request with tools disabled so it can summarize completed work and identify anything incomplete instead of discarding the last tool results.
 
 Implemented tools are `list_files`, `read_file`, `edit_file`, `write_file`, `create_file`, `git_status`, `git_diff`, and `run_command`. Mutating file tools use the same authorized-root and conflict checks as the editor. Commands run directly without a shell and have program, argument-count, output-size, and timeout limits.
 
@@ -74,9 +75,9 @@ The OpenAI settings include a small reference list from the official current tex
 
 Runtime events contain an event ID, run ID, session ID, per-run sequence number, timestamp, type, and JSON payload. Events are appended to SQLite before they are emitted over the Tauri channel. The desktop restores recent events on startup.
 
-Current events cover run creation, model requests and deltas, tool start/completion/failure, file changes, agent start/completion, usage, completion, cancellation, and failures. Mutating file tools include a normalized relative path and changed line range in `file.changed`. Bounded commands compare per-file Git fingerprints before and after execution, so formatter and generator changes also emit file events. The renderer uses that evidence to activate Code, load the file, center the range, and mark it once. Manual navigation pauses following, duplicate event IDs are ignored, and unsaved drafts block automatic replacement until they are saved or reverted. Agent and parent-agent IDs provide the current root-to-specialist causal link. A durable general task graph remains planned.
+Current events cover run creation and steering, model requests and deltas, tool start/completion/failure, file changes, agent start/completion, usage, completion, cancellation, and failures. `run.steered` records the root turn boundary where queued guidance entered the model transcript. Mutating file tools include a normalized relative path and changed line range in `file.changed`. Bounded commands compare per-file Git fingerprints before and after execution, so formatter and generator changes also emit file events. The renderer uses that evidence to activate Code, load the file, center the range, and mark it once. Manual navigation pauses following, duplicate event IDs are ignored, and unsaved drafts block automatic replacement until they are saved or reverted. Agent and parent-agent IDs provide the current root-to-specialist causal link. A durable general task graph remains planned.
 
-While a run owns the workspace, the conversation remains writable. Follow-up prompts are held in a visible per-session renderer queue and submitted serially after the active run completes. Stopping a run preserves those pending turns but pauses automatic execution; the user can remove them or explicitly run the next item. The queue is process-local; accepted messages and completed run output remain durable in SQLite.
+While a run owns the workspace, the conversation remains writable. The composer defaults to `Guide run` for Responses agents and can switch to `Queue next`. The host accepts at most 16 pending guidance messages of 2,000 characters each, persists them in SQLite, and closes the inbox atomically when natural completion wins the race. Follow-up prompts are held in a visible per-session renderer queue and submitted serially after the active run completes. Stopping a run preserves those pending turns but pauses automatic execution; the user can remove them or explicitly run the next item. The follow-up queue is process-local; accepted guidance, user messages, and completed run output remain durable in SQLite.
 
 ## Sessions, context, and memory
 

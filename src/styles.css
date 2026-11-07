@@ -972,6 +972,46 @@ kbd,
 
 .composer:focus-within { border-color: rgba(98, 217, 187, 0.4); }
 
+.composer-mode-row {
+  display: flex;
+  padding: 8px 8px 0;
+}
+
+.composer-mode {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  width: 100%;
+  max-width: 240px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-raised);
+}
+
+.composer-mode button {
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.composer-mode button:hover { color: var(--text-secondary); }
+.composer-mode button.is-active { background: var(--surface-panel); color: var(--text); }
+.composer-mode button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.composer-mode button:disabled { color: var(--text-muted); cursor: wait; }
+
+.composer-notice {
+  padding: 8px 12px 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 16px;
+}
+
 .composer textarea {
   display: block;
   width: 100%;
