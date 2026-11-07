@@ -1,8 +1,10 @@
 # Changelog
 
-This project has no tagged public release yet. The current package version is `0.3.0`, an unsigned developer preview.
+The current public release is `0.3.0`, an unsigned developer preview.
 
 ## Unreleased
+
+## 0.3.0 - 2026-11-07
 
 ### Added
 

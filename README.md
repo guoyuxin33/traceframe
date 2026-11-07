@@ -1,10 +1,23 @@
 # Traceframe
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 Traceframe is a native Tauri coding workspace that keeps model activity, tool calls, file changes, Git state, context, and memory visible while a task runs.
 
 ![Traceframe workspace](docs/assets/traceframe-workspace.png)
 
 _Traceframe 0.3 running as a native macOS application with a real local repository loaded. Preview and Terminal are additional draggable dock tabs in the current build._
+
+## Download and install
+
+Download the current public build from [GitHub Releases](https://github.com/guoyuxin33/traceframe/releases/latest). Traceframe currently publishes an Apple Silicon (`arm64`) DMG for macOS 12 or later.
+
+1. Download `Traceframe_0.3.0_aarch64.dmg` and the accompanying `SHA256SUMS.txt` file.
+2. Optionally verify the download with `shasum -a 256 -c SHA256SUMS.txt` from the download directory.
+3. Open the DMG and drag Traceframe into Applications.
+4. This developer preview is not yet signed or notarized. If macOS blocks the first launch, Control-click Traceframe in Applications, choose **Open**, then confirm **Open**. Do not disable Gatekeeper.
+
+Windows, Linux, and Intel macOS installers are not published yet. Source builds remain available to contributors who meet the development requirements below.
 
 ## Current development build
 
