@@ -321,6 +321,29 @@ describe('execution evidence', () => {
     expect(onOpenExecutionFile).toHaveBeenCalledWith('src/App.tsx')
   })
 
+  it('expands and collapses every execution step from the timeline controls', async () => {
+    const user = userEvent.setup()
+    render(<ConversationPanel
+      session={activeSession}
+      messages={[]}
+      agents={[]}
+      disabled={false}
+      events={events}
+      onSend={vi.fn().mockResolvedValue(true)}
+    />)
+
+    const disclosures = screen.getAllByRole('group').filter((element) => element.classList.contains('execution-step'))
+    expect(disclosures).toHaveLength(executionSteps(events).length)
+    expect(disclosures.every((element) => !element.hasAttribute('open'))).toBe(true)
+
+    await user.click(screen.getByRole('button', { name: 'Expand all execution steps' }))
+    expect(disclosures.every((element) => element.hasAttribute('open'))).toBe(true)
+    expect(screen.getByText('#3')).toBeVisible()
+
+    await user.click(screen.getByRole('button', { name: 'Collapse all execution steps' }))
+    expect(disclosures.every((element) => !element.hasAttribute('open'))).toBe(true)
+  })
+
   it('auto-collapses a completed step unless the user changed its disclosure', async () => {
     const baseProps = { session: activeSession, messages: [], agents: [], disabled: false, onSend: vi.fn().mockResolvedValue(true) }
     const { rerender } = render(<ConversationPanel {...baseProps} events={events.slice(0, 3)} />)
@@ -1001,6 +1024,8 @@ describe('narrow editor toolbar', () => {
     const styles = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8')
     expect(styles).toContain('@container (max-width: 420px)')
     expect(styles).toContain('.editor-actions { grid-column: 1 / -1; }')
+    expect(styles).toContain('.editor-layout { grid-template-columns: 136px minmax(0, 1fr); }')
+    expect(styles).toMatch(/\.code-view,[\s\S]*\.terminal-view \{[\s\S]*min-width: 0;/)
   })
 
   it('invokes edit, draft, revert, and save controls', async () => {

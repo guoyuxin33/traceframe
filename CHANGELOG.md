@@ -20,6 +20,7 @@ This project has no tagged public release yet. The current package version is `0
 - Per-session follow-up prompt queues with Enter-to-send, Shift+Enter multiline input, visible ordering, removal, and automatic serial execution.
 - Pi-style host-side steering for Responses runs, with a distinct `Guide run` composer mode, durable user messages, bounded FIFO delivery at root turn boundaries, and `run.steered` trace evidence.
 - Host-enforced `scout`, `reviewer`, and `worker` child-agent profiles with read-only tool boundaries for investigation and review.
+- Numbered execution steps with expand-all and collapse-all controls in Conversation and Trace.
 
 ### Changed
 
@@ -33,6 +34,7 @@ This project has no tagged public release yet. The current package version is `0
 - File paths emitted by mutating runtime tools are normalized before renderer navigation.
 - Active tool results are bounded before re-entering model context, while command output pipes continue draining to EOF.
 - Chat and Anthropic streams require their terminal frame before a reply is persisted as complete.
+- Code, diff, output, and execution-evidence surfaces use a dedicated high-contrast code palette and adapt to narrow dock widths.
 
 ### Fixed
 

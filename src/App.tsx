@@ -9,6 +9,8 @@ import {
   Bot,
   Boxes,
   CheckCircle2,
+  ChevronsDown,
+  ChevronsUp,
   CircleX,
   Clock,
   Command,
@@ -674,6 +676,11 @@ export function MarkdownBody({ body }: { body: string }) {
 
 type ExecutionStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'info'
 
+interface ExecutionDisclosureCommand {
+  open: boolean
+  revision: number
+}
+
 export interface ExecutionFileChange {
   path: string
   startLine: number
@@ -879,11 +886,24 @@ function ExecutionStatusIcon({ status }: { status: ExecutionStatus }) {
   return <CheckCircle2 size={14} />
 }
 
-function ExecutionStepDisclosure({ step, onOpenFile }: { step: ExecutionStep; onOpenFile?: (path: string) => void }) {
+function ExecutionStepDisclosure({
+  step,
+  command,
+  onOpenFile,
+}: {
+  step: ExecutionStep
+  command?: ExecutionDisclosureCommand | null
+  onOpenFile?: (path: string) => void
+}) {
   const [open, setOpen] = useState(step.status === 'running')
   const userToggled = useRef(false)
   const previousStatus = useRef(step.status)
   const disclosureLabel = `${step.title}: ${step.summary} (step ${step.sequence})`
+  useEffect(() => {
+    if (!command) return
+    userToggled.current = true
+    setOpen(command.open)
+  }, [command?.revision])
   useEffect(() => {
     if (previousStatus.current === 'running' && step.status !== 'running' && !userToggled.current) setOpen(false)
     previousStatus.current = step.status
@@ -891,7 +911,7 @@ function ExecutionStepDisclosure({ step, onOpenFile }: { step: ExecutionStep; on
   return <details aria-label={disclosureLabel} className={`execution-step state-${step.status}`} open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
     <summary aria-label={disclosureLabel} onClick={() => { userToggled.current = true }}>
       <span className="execution-status"><ExecutionStatusIcon status={step.status} /></span>
-      <span className="execution-step-copy"><strong>{step.title}</strong><small>{step.summary}</small></span>
+      <span className="execution-step-copy"><strong><code>#{step.sequence}</code><span>{step.title}</span></strong><small>{step.summary}</small></span>
       {step.durationMs !== undefined ? <time>{formatDuration(step.durationMs)}</time> : null}
       <ChevronRight className="execution-chevron" size={14} />
     </summary>
@@ -908,10 +928,17 @@ function ExecutionStepDisclosure({ step, onOpenFile }: { step: ExecutionStep; on
   </details>
 }
 
-function ExecutionStepList({ steps, onOpenFile }: { steps: ExecutionStep[]; onOpenFile?: (path: string) => void }) {
+function ExecutionStepList({ steps, command, onOpenFile }: { steps: ExecutionStep[]; command?: ExecutionDisclosureCommand | null; onOpenFile?: (path: string) => void }) {
   return <div className="execution-steps">
-    {steps.map((step) => <ExecutionStepDisclosure step={step} onOpenFile={onOpenFile} key={step.id} />)}
+    {steps.map((step) => <ExecutionStepDisclosure step={step} command={command} onOpenFile={onOpenFile} key={step.id} />)}
   </div>
+}
+
+function ExecutionDisclosureControls({ onExpand, onCollapse }: { onExpand: () => void; onCollapse: () => void }) {
+  return <span className="execution-controls" role="group" aria-label="Execution step display">
+    <button type="button" onClick={onExpand} aria-label="Expand all execution steps" title="Expand all execution steps"><ChevronsDown size={13} /></button>
+    <button type="button" onClick={onCollapse} aria-label="Collapse all execution steps" title="Collapse all execution steps"><ChevronsUp size={13} /></button>
+  </span>
 }
 
 function latestRunId(events: RuntimeEventRecord[]) {
@@ -942,6 +969,7 @@ export function currentExecutionSummary(events: RuntimeEventRecord[], runId?: st
 }
 
 function ExecutionTimeline({ events, onOpenFile }: { events: RuntimeEventRecord[]; onOpenFile?: (path: string) => void }) {
+  const [command, setCommand] = useState<ExecutionDisclosureCommand | null>(null)
   const runId = latestRunId(events)
   if (!runId) return null
   const runEvents = events.filter((event) => event.runId === runId)
@@ -953,8 +981,12 @@ function ExecutionTimeline({ events, onOpenFile }: { events: RuntimeEventRecord[
       <span className="execution-run-mark"><Command size={14} /></span>
       <span><strong>{firstString(started?.payload.provider) ?? 'Agent run'}</strong><small>{firstString(started?.payload.model) ?? runId.slice(0, 8)}</small></span>
       <b>{status}</b>
+      <ExecutionDisclosureControls
+        onExpand={() => setCommand((current) => ({ open: true, revision: (current?.revision ?? 0) + 1 }))}
+        onCollapse={() => setCommand((current) => ({ open: false, revision: (current?.revision ?? 0) + 1 }))}
+      />
     </header>
-    <ExecutionStepList steps={steps} onOpenFile={onOpenFile} />
+    <ExecutionStepList steps={steps} command={command} onOpenFile={onOpenFile} />
   </section>
 }
 
@@ -1598,13 +1630,18 @@ export function TerminalView({ runState, workspace, branch, events }: { runState
 function TraceRunDisclosure({
   run,
   defaultOpen,
+  command,
   onOpenFile,
 }: {
   run: { runId: string; events: RuntimeEventRecord[]; status: ExecutionStatus; steps: ExecutionStep[] }
   defaultOpen: boolean
+  command?: ExecutionDisclosureCommand | null
   onOpenFile?: (path: string) => void
 }) {
   const [open, setOpen] = useState(defaultOpen)
+  useEffect(() => {
+    if (command) setOpen(command.open)
+  }, [command?.revision])
   return <details className={`trace-run state-${run.status}`} open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
     <summary>
       <ExecutionStatusIcon status={run.status} />
@@ -1612,11 +1649,12 @@ function TraceRunDisclosure({
       <time>{new Date(run.events[0]?.timestamp ?? Date.now()).toLocaleTimeString()}</time>
       <ChevronRight size={14} />
     </summary>
-    <ExecutionStepList steps={run.steps} onOpenFile={onOpenFile} />
+    <ExecutionStepList steps={run.steps} command={command} onOpenFile={onOpenFile} />
   </details>
 }
 
 function ActivityView({ events, onOpenFile }: { events: RuntimeEventRecord[]; onOpenFile?: (path: string) => void }) {
+  const [command, setCommand] = useState<ExecutionDisclosureCommand | null>(null)
   const runIds = [...new Set(events.map((event) => event.runId))]
   const runs = runIds.map((runId) => {
     const runEvents = events.filter((event) => event.runId === runId)
@@ -1624,8 +1662,12 @@ function ActivityView({ events, onOpenFile }: { events: RuntimeEventRecord[]; on
   }).sort((left, right) => (right.events.at(-1)?.timestamp ?? 0) - (left.events.at(-1)?.timestamp ?? 0))
   return (
     <div className="trace-list" role="log" aria-live="polite">
+      {runs.length ? <div className="trace-toolbar"><span>Runs</span><ExecutionDisclosureControls
+        onExpand={() => setCommand((current) => ({ open: true, revision: (current?.revision ?? 0) + 1 }))}
+        onCollapse={() => setCommand((current) => ({ open: false, revision: (current?.revision ?? 0) + 1 }))}
+      /></div> : null}
       {runs.map((run, index) => (
-        <TraceRunDisclosure run={run} defaultOpen={index === 0 || run.status === 'failed'} onOpenFile={onOpenFile} key={run.runId} />
+        <TraceRunDisclosure run={run} defaultOpen={index === 0 || run.status === 'failed'} command={command} onOpenFile={onOpenFile} key={run.runId} />
       ))}
       {!runs.length ? <div className="workspace-empty"><Activity size={18} /><strong>No runtime events</strong><p>Streaming text stays in Conversation; tool and lifecycle evidence appears here.</p></div> : null}
     </div>

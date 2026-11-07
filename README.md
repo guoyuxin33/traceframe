@@ -11,7 +11,7 @@ _Traceframe 0.3 running as a native macOS application with a real local reposito
 | Status | Capability |
 | --- | --- |
 | Implemented | Native macOS shell; draggable and resizable persistent dock tabs; authorized workspace picker; bounded file tree; editable UTF-8 file preview with conflict detection; Git status, diffs, branch creation/switching, stage/unstage, commit, pull, and push; persisted sessions, messages, scoped memories, summaries, and runtime events |
-| Implemented | GFM model replies and a collapsible execution timeline that pairs model turns, commands, arguments, results, edited files, line ranges, and agent lifecycle evidence; Traceframe-owned Responses API agent loop with streamed output, cancellation, host-side in-run guidance, separate queued follow-up turns, bounded tools, timing, and usage |
+| Implemented | GFM model replies and an execution timeline with numbered steps, per-step disclosures, and expand/collapse-all controls that pair model turns, commands, arguments, results, edited files, line ranges, and agent lifecycle evidence; Traceframe-owned Responses API agent loop with streamed output, cancellation, host-side in-run guidance, separate queued follow-up turns, bounded tools, timing, and usage |
 | Implemented | Model-directed serial delegation to as many as four bounded child agents per run, with host-enforced read-only `scout`/`reviewer` and write-capable `worker` profiles, inherited provider/model/workspace scope, non-recursive child tools, and visible parent/child events |
 | Implemented | Direct OpenAI Responses, local CC Switch Responses routing, Anthropic streaming, and OpenAI-compatible chat providers; provider health checks and model discovery |
 | Planned | Isolated child worktrees, conflict-aware merge queues, per-agent configuration, authoritative context budgets, and interactive terminal input |
@@ -38,16 +38,16 @@ The OpenAI settings list the current general-purpose text and code models from t
 
 ## Workspace
 
-Every main surface is a dock tab and can be rearranged and resized. Layouts persist locally and can be reset or changed from Appearance settings.
+Every main surface is a dock tab and can be rearranged and resized. Code, diff, and output surfaces adapt to narrow dock widths without forcing the surrounding layout wider. Layouts persist locally and can be reset or changed from Appearance settings.
 
 | Area | Current behavior |
 | --- | --- |
 | Sessions | Create, search, archive, restore, and persist task history |
-| Conversation | Render streamed and completed model replies as GitHub-flavored Markdown; inspect each run as collapsible model, command, file, and agent steps; send with Enter, add a line with Shift+Enter, guide an active Responses run, or manage queued follow-up turns |
+| Conversation | Render streamed and completed model replies as GitHub-flavored Markdown; inspect numbered model, command, file, and agent steps individually or expand/collapse the whole run; send with Enter, add a line with Shift+Enter, guide an active Responses run, or manage queued follow-up turns |
 | Code | Preview, edit, save, revert, detect conflicting external changes, and follow agent edits to the current file and changed line range without discarding local drafts |
 | Diff | Inspect staged and unstaged changes for the selected file |
 | Source | Open Source Control from the left activity rail; refresh status; inspect staged and working-tree changes separately; create or switch branches; stage, unstage, commit, fast-forward pull, push or publish, and expand the latest 50 commit records |
-| Output and trace | Inspect paired command output and per-run collapsible model, tool, file-change, usage, completion, failure, and cancellation evidence |
+| Output and trace | Inspect paired command output and per-run model, tool, file-change, usage, completion, failure, and cancellation evidence with global expand/collapse controls |
 | Context and memory | Review deterministic session summaries and manage session, project, and global memory records |
 | Agents | Follow the root agent and real delegated specialists, including their task, parent, model, progress state, and result |
 
